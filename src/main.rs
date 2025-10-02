@@ -172,21 +172,38 @@ fn render_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             *should_render = false;
         }
 
-        // Take a snapshot of the current board
-        let board_snapshot = {
+        // Build the scene while holding the board lock
+        let scene = {
             let board = shared.board.lock().unwrap();
-            board.clone()
+            let mut scene = Scene::new();
+
+            // Draw the full board
+            for (row_idx, row) in board.cells.iter().enumerate() {
+                for (col_idx, &cell) in row.iter().enumerate() {
+                    let x = col_idx as f64 * CELL_SIZE;
+                    let y = row_idx as f64 * CELL_SIZE;
+                    let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
+                    scene.fill(
+                        vello::peniko::Fill::NonZero,
+                        vello::kurbo::Affine::IDENTITY,
+                        cell.color(),
+                        None,
+                        &rect,
+                    );
+                }
+            }
+
+            scene
         };
 
-        // Note: We'll build the scene in the main thread after receiving this
-        // Just send the board snapshot as part of the event
-        let _ = proxy.send_event(UserEvent::RenderComplete(board_snapshot));
+        // Send the built scene to the main thread
+        let _ = proxy.send_event(UserEvent::RenderComplete(scene));
     }
 }
 
 enum UserEvent {
     ComputeComplete,
-    RenderComplete(Board), // board_snapshot
+    RenderComplete(Scene), // Pre-built scene from render worker
 }
 
 struct App {
@@ -196,7 +213,6 @@ struct App {
     render_surface: Option<RenderSurface<'static>>,
     renderer: Option<Renderer>,
     scene: Option<Scene>,
-    current_board: Option<Board>, // Single full-screen board
 }
 
 impl App {
@@ -208,7 +224,6 @@ impl App {
             render_surface: None,
             renderer: None,
             scene: None,
-            current_board: None,
         }
     }
 
@@ -254,15 +269,20 @@ impl App {
         }
     }
 
-    fn seed_next_board_and_continue(&mut self, completed_board: Board) {
-        let board_width = completed_board.width;
-        let bottom_row = &completed_board.cells[completed_board.height - 1];
+    fn seed_next_board_and_continue(&mut self) {
+        // Lock the board to get the bottom row and dimensions
+        let (board_width, bottom_row) = {
+            let board = self.shared.board.lock().unwrap();
+            let width = board.width;
+            let row = board.cells[board.height - 1].clone();
+            (width, row)
+        };
 
         // Get current seed and white lengths
         let mut seed_len = self.shared.seed_length.lock().unwrap();
         let mut white_len = self.shared.white_length.lock().unwrap();
 
-        let mut new_board = Board::new(completed_board.width, completed_board.height);
+        let mut new_board = Board::new(board_width, BOARD_HEIGHT);
         let mut rng = rand::thread_rng();
 
         if *white_len == 0 {
@@ -457,36 +477,14 @@ impl ApplicationHandler<UserEvent> for App {
                     cvar.notify_one();
                 }
             }
-            UserEvent::RenderComplete(board_snapshot) => {
-                // Store the board
-                self.current_board = Some(board_snapshot.clone());
-
-                // Build scene with full screen board
-                let mut scene = Scene::new();
-
-                // Draw the full board
-                for (row_idx, row) in board_snapshot.cells.iter().enumerate() {
-                    for (col_idx, &cell) in row.iter().enumerate() {
-                        let x = col_idx as f64 * CELL_SIZE;
-                        let y = row_idx as f64 * CELL_SIZE;
-                        let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
-                        scene.fill(
-                            vello::peniko::Fill::NonZero,
-                            vello::kurbo::Affine::IDENTITY,
-                            cell.color(),
-                            None,
-                            &rect,
-                        );
-                    }
-                }
-
-                // Present the scene
+            UserEvent::RenderComplete(scene) => {
+                // Present the pre-built scene
                 self.present_scene(scene);
 
                 // Now seed the next board and signal compute to continue
                 let paused = *self.shared.paused.lock().unwrap();
                 if !paused {
-                    self.seed_next_board_and_continue(board_snapshot);
+                    self.seed_next_board_and_continue();
                 }
             }
         }
