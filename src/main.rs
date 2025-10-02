@@ -1,4 +1,4 @@
-use rayon::prelude::*;
+use rand::Rng;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use vello::kurbo::RoundedRect;
@@ -14,9 +14,8 @@ use winit::window::{Window, WindowId};
 const CELL_SIZE: f64 = 4.0;
 const WINDOW_WIDTH: u32 = 1600;
 const WINDOW_HEIGHT: u32 = 1200;
-const BOARD_WIDTH: usize = (WINDOW_WIDTH as f64 / CELL_SIZE) as usize;
-const BOARD_HEIGHT: usize = (WINDOW_HEIGHT as f64 / CELL_SIZE) as usize;
-const NUM_THREADS: usize = 1;
+const BOARD_WIDTH: usize = (WINDOW_WIDTH as f64 / CELL_SIZE) as usize; // Full width
+const BOARD_HEIGHT: usize = (WINDOW_HEIGHT as f64 / CELL_SIZE) as usize; // Full height
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CellState {
@@ -62,18 +61,6 @@ impl Board {
             height,
         }
     }
-
-    fn is_complete(&self) -> bool {
-        self.cells
-            .iter()
-            .all(|row| row.iter().all(|&cell| cell != CellState::None))
-    }
-
-    fn reset_with_last_row(&mut self) {
-        let last_row = self.cells[self.height - 1].clone();
-        self.cells = vec![vec![CellState::None; self.width]; self.height];
-        self.cells[0] = last_row;
-    }
 }
 
 struct SharedState {
@@ -81,7 +68,8 @@ struct SharedState {
     paused: Arc<Mutex<bool>>,
     compute_cv: Arc<(Mutex<bool>, Condvar)>,
     render_cv: Arc<(Mutex<bool>, Condvar)>,
-    board_complete: Arc<Mutex<bool>>,
+    seed_length: Arc<Mutex<usize>>, // Length of the seed pattern to take
+    white_length: Arc<Mutex<usize>>, // Length of white padding (used after seed reaches full width)
 }
 
 impl SharedState {
@@ -91,7 +79,8 @@ impl SharedState {
             paused: Arc::new(Mutex::new(true)),
             compute_cv: Arc::new((Mutex::new(false), Condvar::new())),
             render_cv: Arc::new((Mutex::new(false), Condvar::new())),
-            board_complete: Arc::new(Mutex::new(false)),
+            seed_length: Arc::new(Mutex::new(1)), // Start with 1 cell seed
+            white_length: Arc::new(Mutex::new(0)), // No white padding initially
         }
     }
 }
@@ -139,59 +128,35 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
     true
 }
 
-fn compute_worker(shared: Arc<SharedState>) {
+fn compute_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
     loop {
+        // Wait for signal to start computing
+        {
+            let (lock, cvar) = &*shared.compute_cv;
+            let mut should_compute = lock.lock().unwrap();
+            while !*should_compute {
+                should_compute = cvar.wait(should_compute).unwrap();
+            }
+            *should_compute = false; // Reset flag after starting
+        }
+
         // Check if paused
         let paused = *shared.paused.lock().unwrap();
         if paused {
             continue;
         }
 
-        // Perform computation
-        let board_arc = Arc::clone(&shared.board);
-        let compute_cv = Arc::clone(&shared.compute_cv);
-        let (board_width, board_height) = {
-            let board = board_arc.lock().unwrap();
-            (board.width, board.height)
-        };
-
-        // Split the board into NUM_THREADS vertical columns
-        let chunk_size = (board_width + NUM_THREADS - 1) / NUM_THREADS;
-
-        // Create thread pool to process columns in parallel
-        // Each thread will process a column from left to right, going as deep as possible
-        (0..NUM_THREADS).into_par_iter().for_each(|thread_idx| {
-            let start_col = thread_idx * chunk_size;
-            let end_col = std::cmp::min(start_col + chunk_size, board_width);
-
-            if start_col >= board_width {
-                return;
+        // Compute the entire board sequentially
+        let mut board = shared.board.lock().unwrap();
+        for step in 1..board.height {
+            for cell in 0..board.width {
+                update_cell(&mut board, step, cell);
             }
-
-            // For each row (going down), try to update cells in this thread's column range
-            for step in 1..board_height {
-                // Process cells in this row from left to right within our column range
-                for cell in start_col..end_col {
-                    // Wait for signal to start computing
-                    {
-                        let (lock, cvar) = &*shared.compute_cv;
-                        let mut should_compute = lock.lock().unwrap();
-                        while !*should_compute {
-                            should_compute = cvar.wait(should_compute).unwrap();
-                        }
-                        // Don't set should_compute to false here - let RedrawRequested do it
-                    }
-                    let mut board = board_arc.lock().unwrap();
-                    update_cell(&mut board, step, cell);
-                }
-            }
-        });
-
-        // Check if board is complete
-        let board = shared.board.lock().unwrap();
-        if board.is_complete() {
-            *shared.board_complete.lock().unwrap() = true;
         }
+        drop(board);
+
+        // Notify main thread that computation is complete
+        let _ = proxy.send_event(UserEvent::ComputeComplete);
     }
 }
 
@@ -207,36 +172,21 @@ fn render_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             *should_render = false;
         }
 
-        // Take a snapshot of the board (clone it outside the critical section)
+        // Take a snapshot of the current board
         let board_snapshot = {
             let board = shared.board.lock().unwrap();
             board.clone()
         };
 
-        // Build the scene outside the critical section
-        let mut scene = Scene::new();
-        for (row_idx, row) in board_snapshot.cells.iter().enumerate() {
-            for (col_idx, &cell) in row.iter().enumerate() {
-                let x = col_idx as f64 * CELL_SIZE;
-                let y = row_idx as f64 * CELL_SIZE;
-                let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
-                scene.fill(
-                    vello::peniko::Fill::NonZero,
-                    vello::kurbo::Affine::IDENTITY,
-                    cell.color(),
-                    None,
-                    &rect,
-                );
-            }
-        }
-
-        // Notify main thread that rendering is ready
-        let _ = proxy.send_event(UserEvent::RenderComplete(scene));
+        // Note: We'll build the scene in the main thread after receiving this
+        // Just send the board snapshot as part of the event
+        let _ = proxy.send_event(UserEvent::RenderComplete(board_snapshot));
     }
 }
 
 enum UserEvent {
-    RenderComplete(Scene),
+    ComputeComplete,
+    RenderComplete(Board), // board_snapshot
 }
 
 struct App {
@@ -246,6 +196,7 @@ struct App {
     render_surface: Option<RenderSurface<'static>>,
     renderer: Option<Renderer>,
     scene: Option<Scene>,
+    current_board: Option<Board>, // Single full-screen board
 }
 
 impl App {
@@ -257,10 +208,11 @@ impl App {
             render_surface: None,
             renderer: None,
             scene: None,
+            current_board: None,
         }
     }
 
-    fn handle_render_complete(&mut self, scene: Scene) {
+    fn present_scene(&mut self, scene: Scene) {
         self.scene = Some(scene);
         if let Some(window) = &self.window {
             window.pre_present_notify();
@@ -299,25 +251,105 @@ impl App {
 
                 surface_texture.present();
             }
+        }
+    }
 
-            // Check if board is complete
-            if *self.shared.board_complete.lock().unwrap() {
-                // Pause - but don't reset the board yet
-                // User must unpause to reset and continue
-                *self.shared.paused.lock().unwrap() = true;
+    fn seed_next_board_and_continue(&mut self, completed_board: Board) {
+        let board_width = completed_board.width;
+        let bottom_row = &completed_board.cells[completed_board.height - 1];
 
-                // Set should_compute to false
-                {
-                    let (lock, _) = &*self.shared.compute_cv;
-                    let mut should_compute = lock.lock().unwrap();
-                    *should_compute = false;
-                }
+        // Get current seed and white lengths
+        let mut seed_len = self.shared.seed_length.lock().unwrap();
+        let mut white_len = self.shared.white_length.lock().unwrap();
 
-                // Don't clear board_complete yet - we'll check it when unpausing
+        let mut new_board = Board::new(completed_board.width, completed_board.height);
+        let mut rng = rand::thread_rng();
+
+        if *white_len == 0 {
+            // Phase 1: Expand the seed from the right edge
+            let old_seed_len = (*seed_len).min(board_width);
+
+            // Grow by a random amount
+            let growth = rng.gen_range(1..=10);
+            let new_seed_len = (old_seed_len + growth).min(board_width);
+            *seed_len = new_seed_len;
+
+            let start_pos = board_width - new_seed_len;
+            let old_start_pos = board_width - old_seed_len;
+
+            // White padding on left
+            for i in 0..start_pos {
+                new_board.cells[0][i] = CellState::Zero;
             }
 
-            // Always request next frame to keep rendering, even if paused
-            window.request_redraw();
+            // Copy the old seed from the previous bottom row
+            let cells_to_copy = old_seed_len.min(board_width - (start_pos + growth));
+            for i in 0..cells_to_copy {
+                if start_pos + growth + i < board_width && old_start_pos + i < board_width {
+                    new_board.cells[0][start_pos + growth + i] = bottom_row[old_start_pos + i];
+                }
+            }
+
+            // Add new random cells to the left of the existing seed (growing leftward)
+            for i in start_pos..(start_pos + growth).min(board_width) {
+                new_board.cells[0][i] = if rng.gen::<bool>() {
+                    CellState::One
+                } else {
+                    CellState::Zero
+                };
+            }
+
+            if *seed_len >= board_width {
+                *white_len = 1;
+            }
+        } else {
+            // Phase 2: White cells expand from left, shrinking the seed on the right
+            let old_white_len = *white_len;
+            let growth = rng.gen_range(1..=10);
+            let new_white_len = (old_white_len + growth).min(board_width);
+            *white_len = new_white_len;
+
+            // White cells on left
+            for i in 0..new_white_len {
+                new_board.cells[0][i] = CellState::Zero;
+            }
+
+            // Copy the remaining seed from the previous bottom row
+            let random_portion = board_width.saturating_sub(new_white_len);
+
+            // The seed shifts left as white expands
+            for i in 0..random_portion {
+                let source_idx = old_white_len + i + growth;
+                if source_idx < board_width {
+                    new_board.cells[0][new_white_len + i] = bottom_row[source_idx];
+                } else {
+                    // If we run out of source, fill with random
+                    new_board.cells[0][new_white_len + i] = if rng.gen::<bool>() {
+                        CellState::One
+                    } else {
+                        CellState::Zero
+                    };
+                }
+            }
+
+            if *white_len >= board_width {
+                *seed_len = 1;
+                *white_len = 0;
+            }
+        }
+
+        drop(seed_len);
+        drop(white_len);
+
+        // Update shared state
+        *self.shared.board.lock().unwrap() = new_board;
+
+        // Signal compute thread to continue
+        {
+            let (lock, cvar) = &*self.shared.compute_cv;
+            let mut should_compute = lock.lock().unwrap();
+            *should_compute = true;
+            cvar.notify_one();
         }
     }
 }
@@ -393,55 +425,14 @@ impl ApplicationHandler<UserEvent> for App {
                 let new_paused = *paused;
                 drop(paused);
 
-                println!("New paused: {:?}", new_paused);
-
                 if !new_paused {
-                    // Check if board was complete when we paused
-                    let was_complete = *self.shared.board_complete.lock().unwrap();
-
-                    if was_complete {
-                        // Reset board with last row before continuing
-                        let mut board = self.shared.board.lock().unwrap();
-                        board.reset_with_last_row();
-                        *self.shared.board_complete.lock().unwrap() = false;
-                    }
-
-                    // Unpause: signal compute to start and request redraw
+                    // Unpause: signal compute to start
                     {
                         let (lock, cvar) = &*self.shared.compute_cv;
                         let mut should_compute = lock.lock().unwrap();
                         *should_compute = true;
                         cvar.notify_one();
                     }
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                } else {
-                    // Pause: set should_compute to false and request redraw to show paused state
-                    {
-                        let (lock, _) = &*self.shared.compute_cv;
-                        let mut should_compute = lock.lock().unwrap();
-                        *should_compute = false;
-                    }
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                println!("WindowEvent::RedrawRequested");
-                // Notify compute thread to wait (it will wait on next cycle)
-                {
-                    let (lock, _cvar) = &*self.shared.compute_cv;
-                    let mut should_compute = lock.lock().unwrap();
-                    *should_compute = false;
-                }
-                // Notify render thread to start
-                {
-                    let (lock, cvar) = &*self.shared.render_cv;
-                    let mut should_render = lock.lock().unwrap();
-                    *should_render = true;
-                    cvar.notify_one();
                 }
             }
             WindowEvent::Resized(size) => {
@@ -457,19 +448,46 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::RenderComplete(scene) => {
-                println!("UserEvent::RenderComplete");
-                // Notify compute thread to continue
-                let paused = *self.shared.paused.lock().unwrap();
-                if !paused {
-                    println!("Re-starting compute");
-                    let (lock, cvar) = &*self.shared.compute_cv;
-                    let mut should_compute = lock.lock().unwrap();
-                    *should_compute = true;
+            UserEvent::ComputeComplete => {
+                // Computation done, signal render thread to start
+                {
+                    let (lock, cvar) = &*self.shared.render_cv;
+                    let mut should_render = lock.lock().unwrap();
+                    *should_render = true;
                     cvar.notify_one();
                 }
+            }
+            UserEvent::RenderComplete(board_snapshot) => {
+                // Store the board
+                self.current_board = Some(board_snapshot.clone());
 
-                self.handle_render_complete(scene);
+                // Build scene with full screen board
+                let mut scene = Scene::new();
+
+                // Draw the full board
+                for (row_idx, row) in board_snapshot.cells.iter().enumerate() {
+                    for (col_idx, &cell) in row.iter().enumerate() {
+                        let x = col_idx as f64 * CELL_SIZE;
+                        let y = row_idx as f64 * CELL_SIZE;
+                        let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
+                        scene.fill(
+                            vello::peniko::Fill::NonZero,
+                            vello::kurbo::Affine::IDENTITY,
+                            cell.color(),
+                            None,
+                            &rect,
+                        );
+                    }
+                }
+
+                // Present the scene
+                self.present_scene(scene);
+
+                // Now seed the next board and signal compute to continue
+                let paused = *self.shared.paused.lock().unwrap();
+                if !paused {
+                    self.seed_next_board_and_continue(board_snapshot);
+                }
             }
         }
     }
@@ -477,12 +495,6 @@ impl ApplicationHandler<UserEvent> for App {
 
 fn main() {
     let shared = Arc::new(SharedState::new(BOARD_WIDTH, BOARD_HEIGHT));
-
-    // Start compute thread
-    let compute_shared = Arc::clone(&shared);
-    thread::spawn(move || {
-        compute_worker(compute_shared);
-    });
 
     // Create event loop
     let event_loop = EventLoop::<UserEvent>::with_user_event()
@@ -492,10 +504,18 @@ fn main() {
 
     let proxy = event_loop.create_proxy();
 
+    // Start compute thread
+    let compute_shared = Arc::clone(&shared);
+    let compute_proxy = proxy.clone();
+    thread::spawn(move || {
+        compute_worker(compute_shared, compute_proxy);
+    });
+
     // Start render thread
     let render_shared = Arc::clone(&shared);
+    let render_proxy = proxy.clone();
     thread::spawn(move || {
-        render_worker(render_shared, proxy);
+        render_worker(render_shared, render_proxy);
     });
 
     // Run application

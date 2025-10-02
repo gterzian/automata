@@ -38,6 +38,9 @@ Init == /\ steps = [step \in Steps \cup {0} |->
             IF step > 0 THEN [cell \in Cells |-> None] 
             ELSE [cell \in Cells |-> IF cell < N THEN 0 ELSE 1 ]]
 
+\* Note: cells can be updated for any step
+\* in kind of parallel columns, so long as their neighbors and the cell itself
+\* have been updated in all previous steps.
 UpdateCell(step, cell) == LET
                               last_row == steps[step -1]
                               left_neighbor == IF cell -1 > 0 THEN last_row[cell-1] ELSE 0
@@ -61,5 +64,5 @@ Next == \/ \E step \in Steps: \E cell \in Cells: UpdateCell(step, cell)
 -----------------------------------------------------------------------------
 Spec  ==  Init  /\  [][Next]_<<steps>>
 
-THEOREM  Spec  =>  [](TypeOk)
+THEOREM  Spec  =>  [](TypeOk /\ Inv)
 =============================================================================
