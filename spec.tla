@@ -43,6 +43,7 @@ Init == /\ steps = [step \in Steps \cup {0} |->
 \* have been updated in all previous steps.
 UpdateCell(step, cell) == LET
                               last_row == steps[step -1]
+                              \* Note: defaulting to 0 for neighbors outside of the physical board.
                               left_neighbor == IF cell -1 > 0 THEN last_row[cell-1] ELSE 0
                               right_neighbor == IF cell +1 =< N THEN last_row[cell+1] ELSE 0
                               old_state == last_row[cell]
