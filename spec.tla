@@ -38,8 +38,9 @@ Init == /\ steps = [step \in Steps \cup {0} |->
             IF step > 0 THEN [cell \in Cells |-> None] 
             ELSE [cell \in Cells |-> IF cell < N THEN 0 ELSE 1 ]]
 
-\* Note: cells can be updated for any step
-\* in kind of parallel columns, so long as their neighbors and the cell itself
+\* Note: cells can be updated for any step,
+\* forming parallel columns, 
+\* so long as their neighbors and the cell itself
 \* have been updated in all previous steps.
 UpdateCell(step, cell) == LET
                               last_row == steps[step -1]
