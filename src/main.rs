@@ -1,6 +1,15 @@
+// Rule 110 Cellular Automaton Visualizer
+//
+// Displays the evolution of a 1D Rule 110 cellular automaton as a 2D history.
+// - Press and hold SPACE to compute and render (10 rows per frame)
+// - Release SPACE to pause
+// - Each board starts with a random seed pattern
+// - Automatically restarts with new random seed when board is complete
+
 use rand::Rng;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Instant;
 use vello::kurbo::RoundedRect;
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
@@ -14,8 +23,9 @@ use winit::window::{Window, WindowId};
 const CELL_SIZE: f64 = 4.0;
 const WINDOW_WIDTH: u32 = 1600;
 const WINDOW_HEIGHT: u32 = 1200;
-const BOARD_WIDTH: usize = (WINDOW_WIDTH as f64 / CELL_SIZE) as usize; // Full width
-const BOARD_HEIGHT: usize = (WINDOW_HEIGHT as f64 / CELL_SIZE) as usize; // Full height
+const BOARD_WIDTH: usize = (WINDOW_WIDTH as f64 / CELL_SIZE) as usize;
+const BOARD_HEIGHT: usize = (WINDOW_HEIGHT as f64 / CELL_SIZE) as usize;
+const STEPS_PER_FRAME: usize = 10; // Rows computed per frame
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CellState {
@@ -61,31 +71,76 @@ impl Board {
             height,
         }
     }
+
+    fn new_with_random_seed(width: usize, height: usize, seed_length: usize) -> Self {
+        let mut cells = vec![vec![CellState::None; width]; height];
+        let mut rng = rand::thread_rng();
+
+        let actual_seed_length = seed_length.min(width);
+        let start_pos = width - actual_seed_length;
+
+        // White padding on left
+        for i in 0..start_pos {
+            cells[0][i] = CellState::Zero;
+        }
+
+        // Random seed on the right
+        for i in start_pos..width {
+            cells[0][i] = if rng.gen::<bool>() {
+                CellState::One
+            } else {
+                CellState::Zero
+            };
+        }
+
+        Board {
+            cells,
+            width,
+            height,
+        }
+    }
 }
+
+// ============================================================================
+// Shared State & Synchronization
+// ============================================================================
 
 struct SharedState {
     board: Arc<Mutex<Board>>,
+    next_board: Arc<Mutex<Option<Board>>>, // Next board for transition
+    transition_progress: Arc<Mutex<f64>>,  // 0.0 = show board, 1.0 = show next_board
+    transition_start: Arc<Mutex<Option<Instant>>>, // When transition started
     paused: Arc<Mutex<bool>>,
     compute_cv: Arc<(Mutex<bool>, Condvar)>,
     render_cv: Arc<(Mutex<bool>, Condvar)>,
     seed_length: Arc<Mutex<usize>>, // Length of the seed pattern to take
-    white_length: Arc<Mutex<usize>>, // Length of white padding (used after seed reaches full width)
+    current_step: Arc<Mutex<usize>>, // Current row being computed
 }
 
 impl SharedState {
     fn new(width: usize, height: usize) -> Self {
         SharedState {
             board: Arc::new(Mutex::new(Board::new(width, height))),
+            next_board: Arc::new(Mutex::new(None)),
+            transition_progress: Arc::new(Mutex::new(0.0)),
+            transition_start: Arc::new(Mutex::new(None)),
             paused: Arc::new(Mutex::new(true)),
             compute_cv: Arc::new((Mutex::new(false), Condvar::new())),
             render_cv: Arc::new((Mutex::new(false), Condvar::new())),
             seed_length: Arc::new(Mutex::new(1)), // Start with 1 cell seed
-            white_length: Arc::new(Mutex::new(0)), // No white padding initially
+            current_step: Arc::new(Mutex::new(1)), // Start at step 1
         }
     }
 }
 
-// UpdateCell implementation following the TLA+ spec
+// ============================================================================
+// Rule 110 Implementation
+// ============================================================================
+
+// Rule 110 as per TLA+ spec UpdateCell:
+// 1. (1,1,1) → 0
+// 2. (?,0,1) → 1
+// 3. OTHER → preserve state
 fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
     if step == 0 || board.cells[step][cell] != CellState::None {
         return false;
@@ -112,7 +167,10 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
         return false;
     }
 
-    // Rule 110 logic from TLA+ spec
+    // Rule 110 as per TLA+ spec:
+    // 1. old_state = 1 /\ left_neighbor = 1 /\ right_neighbor = 1 -> 0
+    // 2. old_state = 0 /\ right_neighbor = 1 -> 1
+    // 3. OTHER -> last_row[cell]
     let new_state = if old_state == CellState::One
         && left_neighbor == CellState::One
         && right_neighbor == CellState::One
@@ -127,6 +185,10 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
     board.cells[step][cell] = new_state;
     true
 }
+
+// ============================================================================
+// Worker Threads
+// ============================================================================
 
 fn compute_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
     loop {
@@ -146,17 +208,40 @@ fn compute_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             continue;
         }
 
-        // Compute the entire board sequentially
+        // Get current step and board height
+        let current_step = *shared.current_step.lock().unwrap();
+        let board_height = shared.board.lock().unwrap().height;
+
+        // Check if board is complete
+        if current_step >= board_height {
+            // Board is complete, prepare for transition
+            let computed_board = shared.board.lock().unwrap().clone();
+
+            *shared.next_board.lock().unwrap() = Some(computed_board);
+            *shared.transition_start.lock().unwrap() = Some(Instant::now());
+            *shared.transition_progress.lock().unwrap() = 0.0;
+
+            // Notify main thread that computation is complete
+            let _ = proxy.send_event(UserEvent::ComputeComplete);
+            continue;
+        }
+
+        // Compute next STEPS_PER_FRAME steps
         let mut board = shared.board.lock().unwrap();
-        for step in 1..board.height {
+        let end_step = (current_step + STEPS_PER_FRAME).min(board.height);
+
+        for step in current_step..end_step {
             for cell in 0..board.width {
                 update_cell(&mut board, step, cell);
             }
         }
         drop(board);
 
-        // Notify main thread that computation is complete
-        let _ = proxy.send_event(UserEvent::ComputeComplete);
+        // Update current step
+        *shared.current_step.lock().unwrap() = end_step;
+
+        // Notify main thread to render
+        let _ = proxy.send_event(UserEvent::StepComplete);
     }
 }
 
@@ -172,39 +257,101 @@ fn render_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             *should_render = false;
         }
 
-        // Build the scene while holding the board lock
+        // Get current transition progress
+        let progress = *shared.transition_progress.lock().unwrap();
+
+        // Build the scene - use interpolation to blend colors more efficiently
         let scene = {
             let board = shared.board.lock().unwrap();
+            let next_board = shared.next_board.lock().unwrap();
+
             let mut scene = Scene::new();
 
-            // Draw the full board
-            for (row_idx, row) in board.cells.iter().enumerate() {
-                for (col_idx, &cell) in row.iter().enumerate() {
-                    let x = col_idx as f64 * CELL_SIZE;
-                    let y = row_idx as f64 * CELL_SIZE;
-                    let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
-                    scene.fill(
-                        vello::peniko::Fill::NonZero,
-                        vello::kurbo::Affine::IDENTITY,
-                        cell.color(),
-                        None,
-                        &rect,
-                    );
+            // Helper to linearly interpolate between two colors
+            let lerp_color = |c1: Color, c2: Color, t: f64| -> Color {
+                let t = t.clamp(0.0, 1.0);
+                Color::rgb(
+                    c1.r as f64 / 255.0 * (1.0 - t) + c2.r as f64 / 255.0 * t,
+                    c1.g as f64 / 255.0 * (1.0 - t) + c2.g as f64 / 255.0 * t,
+                    c1.b as f64 / 255.0 * (1.0 - t) + c2.b as f64 / 255.0 * t,
+                )
+            };
+
+            // Draw cells with interpolated colors
+            if let Some(ref next) = *next_board {
+                for (row_idx, (curr_row, next_row)) in
+                    board.cells.iter().zip(next.cells.iter()).enumerate()
+                {
+                    for (col_idx, (&curr_cell, &next_cell)) in
+                        curr_row.iter().zip(next_row.iter()).enumerate()
+                    {
+                        let x = col_idx as f64 * CELL_SIZE;
+                        let y = row_idx as f64 * CELL_SIZE;
+                        let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
+
+                        let color = lerp_color(curr_cell.color(), next_cell.color(), progress);
+
+                        scene.fill(
+                            vello::peniko::Fill::NonZero,
+                            vello::kurbo::Affine::IDENTITY,
+                            color,
+                            None,
+                            &rect,
+                        );
+                    }
+                }
+            } else {
+                // No transition, just draw current board
+                for (row_idx, row) in board.cells.iter().enumerate() {
+                    for (col_idx, &cell) in row.iter().enumerate() {
+                        let x = col_idx as f64 * CELL_SIZE;
+                        let y = row_idx as f64 * CELL_SIZE;
+                        let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
+                        scene.fill(
+                            vello::peniko::Fill::NonZero,
+                            vello::kurbo::Affine::IDENTITY,
+                            cell.color(),
+                            None,
+                            &rect,
+                        );
+                    }
                 }
             }
 
             scene
         };
 
+        // Determine if transition is complete
+        let is_complete = progress >= 1.0;
+
         // Send the built scene to the main thread
-        let _ = proxy.send_event(UserEvent::RenderComplete(scene));
+        let render_type = if is_complete {
+            RenderType::Final(scene)
+        } else {
+            RenderType::Transition(scene)
+        };
+        let _ = proxy.send_event(UserEvent::RenderComplete(render_type));
     }
+}
+
+// ============================================================================
+// Event Types
+// ============================================================================
+
+enum RenderType {
+    Transition(Scene), // Intermediate frame during transition
+    Final(Scene),      // Final frame, transition complete
 }
 
 enum UserEvent {
     ComputeComplete,
-    RenderComplete(Scene), // Pre-built scene from render worker
+    StepComplete,
+    RenderComplete(RenderType),
 }
+
+// ============================================================================
+// Application State & Event Handling
+// ============================================================================
 
 struct App {
     shared: Arc<SharedState>,
@@ -227,139 +374,23 @@ impl App {
         }
     }
 
-    fn present_scene(&mut self, scene: Scene) {
-        self.scene = Some(scene);
-        if let Some(window) = &self.window {
-            window.pre_present_notify();
-
-            // Present the frame
-            if let (Some(renderer), Some(surface), Some(render_cx), Some(scene)) = (
-                &mut self.renderer,
-                &mut self.render_surface,
-                &self.render_cx,
-                &self.scene,
-            ) {
-                let device = &render_cx.devices[surface.dev_id].device;
-                let queue = &render_cx.devices[surface.dev_id].queue;
-
-                let width = surface.config.width;
-                let height = surface.config.height;
-                let surface_texture = surface
-                    .surface
-                    .get_current_texture()
-                    .expect("failed to get surface texture");
-
-                renderer
-                    .render_to_surface(
-                        device,
-                        queue,
-                        scene,
-                        &surface_texture,
-                        &vello::RenderParams {
-                            base_color: Color::WHITE,
-                            width,
-                            height,
-                            antialiasing_method: AaConfig::Area,
-                        },
-                    )
-                    .expect("failed to render to surface");
-
-                surface_texture.present();
-            }
-        }
-    }
-
     fn seed_next_board_and_continue(&mut self) {
-        // Lock the board to get the bottom row and dimensions
-        let (board_width, bottom_row) = {
+        // Lock the board to get dimensions
+        let board_width = {
             let board = self.shared.board.lock().unwrap();
-            let width = board.width;
-            let row = board.cells[board.height - 1].clone();
-            (width, row)
+            board.width
         };
 
-        // Get current seed and white lengths
-        let mut seed_len = self.shared.seed_length.lock().unwrap();
-        let mut white_len = self.shared.white_length.lock().unwrap();
-
-        let mut new_board = Board::new(board_width, BOARD_HEIGHT);
+        // Generate a random seed length (somewhere between 10 and full width)
         let mut rng = rand::thread_rng();
+        let new_seed_length = rng.gen_range(10..=board_width);
 
-        if *white_len == 0 {
-            // Phase 1: Expand the seed from the right edge
-            let old_seed_len = (*seed_len).min(board_width);
+        // Reset seed length tracker and current step
+        *self.shared.seed_length.lock().unwrap() = new_seed_length;
+        *self.shared.current_step.lock().unwrap() = 1; // Reset to step 1
 
-            // Grow by a random amount
-            let growth = rng.gen_range(1..=10);
-            let new_seed_len = (old_seed_len + growth).min(board_width);
-            *seed_len = new_seed_len;
-
-            let start_pos = board_width - new_seed_len;
-            let old_start_pos = board_width - old_seed_len;
-
-            // White padding on left
-            for i in 0..start_pos {
-                new_board.cells[0][i] = CellState::Zero;
-            }
-
-            // Copy the old seed from the previous bottom row
-            let cells_to_copy = old_seed_len.min(board_width - (start_pos + growth));
-            for i in 0..cells_to_copy {
-                if start_pos + growth + i < board_width && old_start_pos + i < board_width {
-                    new_board.cells[0][start_pos + growth + i] = bottom_row[old_start_pos + i];
-                }
-            }
-
-            // Add new random cells to the left of the existing seed (growing leftward)
-            for i in start_pos..(start_pos + growth).min(board_width) {
-                new_board.cells[0][i] = if rng.gen::<bool>() {
-                    CellState::One
-                } else {
-                    CellState::Zero
-                };
-            }
-
-            if *seed_len >= board_width {
-                *white_len = 1;
-            }
-        } else {
-            // Phase 2: White cells expand from left, shrinking the seed on the right
-            let old_white_len = *white_len;
-            let growth = rng.gen_range(1..=10);
-            let new_white_len = (old_white_len + growth).min(board_width);
-            *white_len = new_white_len;
-
-            // White cells on left
-            for i in 0..new_white_len {
-                new_board.cells[0][i] = CellState::Zero;
-            }
-
-            // Copy the remaining seed from the previous bottom row
-            let random_portion = board_width.saturating_sub(new_white_len);
-
-            // The seed shifts left as white expands
-            for i in 0..random_portion {
-                let source_idx = old_white_len + i + growth;
-                if source_idx < board_width {
-                    new_board.cells[0][new_white_len + i] = bottom_row[source_idx];
-                } else {
-                    // If we run out of source, fill with random
-                    new_board.cells[0][new_white_len + i] = if rng.gen::<bool>() {
-                        CellState::One
-                    } else {
-                        CellState::Zero
-                    };
-                }
-            }
-
-            if *white_len >= board_width {
-                *seed_len = 1;
-                *white_len = 0;
-            }
-        }
-
-        drop(seed_len);
-        drop(white_len);
+        // Create a new board with a random seed
+        let new_board = Board::new_with_random_seed(board_width, BOARD_HEIGHT, new_seed_length);
 
         // Update shared state
         *self.shared.board.lock().unwrap() = new_board;
@@ -430,23 +461,65 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
+            WindowEvent::RedrawRequested => {
+                // Present the current scene when redraw is requested
+                if let Some(scene) = self.scene.clone() {
+                    if let Some(window) = &self.window {
+                        window.pre_present_notify();
+
+                        if let (Some(renderer), Some(surface), Some(render_cx)) = (
+                            &mut self.renderer,
+                            &mut self.render_surface,
+                            &self.render_cx,
+                        ) {
+                            let device = &render_cx.devices[surface.dev_id].device;
+                            let queue = &render_cx.devices[surface.dev_id].queue;
+
+                            let width = surface.config.width;
+                            let height = surface.config.height;
+                            let surface_texture = surface
+                                .surface
+                                .get_current_texture()
+                                .expect("failed to get surface texture");
+
+                            renderer
+                                .render_to_surface(
+                                    device,
+                                    queue,
+                                    &scene,
+                                    &surface_texture,
+                                    &vello::RenderParams {
+                                        base_color: Color::WHITE,
+                                        width,
+                                        height,
+                                        antialiasing_method: AaConfig::Area,
+                                    },
+                                )
+                                .expect("failed to render to surface");
+
+                            surface_texture.present();
+                        }
+                    }
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
                         logical_key: Key::Named(NamedKey::Space),
-                        state: ElementState::Pressed,
+                        state,
                         ..
                     },
                 ..
             } => {
-                // Toggle pause state
+                // Space bar: work only while pressed
+                let should_work = state == ElementState::Pressed;
                 let mut paused = self.shared.paused.lock().unwrap();
-                *paused = !*paused;
-                let new_paused = *paused;
+                let was_paused = *paused;
+                *paused = !should_work;
                 drop(paused);
 
-                if !new_paused {
-                    // Unpause: signal compute to start
+                if was_paused && should_work {
+                    // Just started: signal compute to start
                     {
                         let (lock, cvar) = &*self.shared.compute_cv;
                         let mut should_compute = lock.lock().unwrap();
@@ -468,8 +541,29 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::StepComplete => {
+                // Render current state
+                {
+                    let (lock, cvar) = &*self.shared.render_cv;
+                    let mut should_render = lock.lock().unwrap();
+                    *should_render = true;
+                    cvar.notify_one();
+                }
+
+                // Continue computing if not paused
+                let paused = *self.shared.paused.lock().unwrap();
+                if !paused {
+                    let (lock, cvar) = &*self.shared.compute_cv;
+                    let mut should_compute = lock.lock().unwrap();
+                    *should_compute = true;
+                    cvar.notify_one();
+                }
+            }
             UserEvent::ComputeComplete => {
-                // Computation done, signal render thread to start
+                // Set progress to 1.0 for instant transition
+                *self.shared.transition_progress.lock().unwrap() = 1.0;
+
+                // Signal render thread to render the final frame
                 {
                     let (lock, cvar) = &*self.shared.render_cv;
                     let mut should_render = lock.lock().unwrap();
@@ -477,14 +571,38 @@ impl ApplicationHandler<UserEvent> for App {
                     cvar.notify_one();
                 }
             }
-            UserEvent::RenderComplete(scene) => {
-                // Present the pre-built scene
-                self.present_scene(scene);
+            UserEvent::RenderComplete(render_type) => {
+                match render_type {
+                    RenderType::Transition(scene) => {
+                        // Progressive rendering: just display current state
+                        self.scene = Some(scene);
 
-                // Now seed the next board and signal compute to continue
-                let paused = *self.shared.paused.lock().unwrap();
-                if !paused {
-                    self.seed_next_board_and_continue();
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                    RenderType::Final(scene) => {
+                        // Store the final scene
+                        self.scene = Some(scene);
+
+                        // Request window redraw to present it
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+
+                        // Transition complete, swap boards
+                        if let Some(next) = self.shared.next_board.lock().unwrap().take() {
+                            *self.shared.board.lock().unwrap() = next;
+                        }
+                        *self.shared.transition_start.lock().unwrap() = None;
+                        *self.shared.transition_progress.lock().unwrap() = 0.0;
+
+                        // Now seed the next board and signal compute to continue
+                        let paused = *self.shared.paused.lock().unwrap();
+                        if !paused {
+                            self.seed_next_board_and_continue();
+                        }
+                    }
                 }
             }
         }
