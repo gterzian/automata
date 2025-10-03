@@ -32,7 +32,6 @@ Inv == \A step \in Steps:
                         /\ steps[step-1][cell] = 0
                      \/ /\ steps[step-1][cell] = 1                                                         
 -----------------------------------------------------------------------------
-
 \* Starting with a single rightmost black cell.
 Init == /\ steps = [step \in Steps \cup {0} |-> 
             IF step > 0 THEN [cell \in Cells |-> None] 
@@ -56,8 +55,7 @@ UpdateCell(step, cell) == LET
                           /\ left_neighbor # None
                           /\ right_neighbor # None
                           /\ steps' = [steps EXCEPT ![step][cell] = new_state]
-                                                 
-        
+                                                       
 Done == /\ \A step \in Steps: \A cell \in Cells: steps[step][cell] # None
         /\ UNCHANGED<<steps>>
 
