@@ -9,7 +9,6 @@
 use rand::Rng;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Instant;
 use vello::kurbo::RoundedRect;
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
@@ -107,13 +106,8 @@ impl Board {
 
 struct SharedState {
     board: Arc<Mutex<Board>>,
-    next_board: Arc<Mutex<Option<Board>>>, // Next board for transition
-    transition_progress: Arc<Mutex<f64>>,  // 0.0 = show board, 1.0 = show next_board
-    transition_start: Arc<Mutex<Option<Instant>>>, // When transition started
-    paused: Arc<Mutex<bool>>,
     compute_cv: Arc<(Mutex<bool>, Condvar)>,
     render_cv: Arc<(Mutex<bool>, Condvar)>,
-    seed_length: Arc<Mutex<usize>>, // Length of the seed pattern to take
     current_step: Arc<Mutex<usize>>, // Current row being computed
 }
 
@@ -121,13 +115,8 @@ impl SharedState {
     fn new(width: usize, height: usize) -> Self {
         SharedState {
             board: Arc::new(Mutex::new(Board::new(width, height))),
-            next_board: Arc::new(Mutex::new(None)),
-            transition_progress: Arc::new(Mutex::new(0.0)),
-            transition_start: Arc::new(Mutex::new(None)),
-            paused: Arc::new(Mutex::new(true)),
             compute_cv: Arc::new((Mutex::new(false), Condvar::new())),
             render_cv: Arc::new((Mutex::new(false), Condvar::new())),
-            seed_length: Arc::new(Mutex::new(1)), // Start with 1 cell seed
             current_step: Arc::new(Mutex::new(1)), // Start at step 1
         }
     }
@@ -190,7 +179,7 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
 // Worker Threads
 // ============================================================================
 
-fn compute_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
+fn compute_worker(shared: Arc<SharedState>) {
     loop {
         // Wait for signal to start computing
         {
@@ -199,30 +188,27 @@ fn compute_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             while !*should_compute {
                 should_compute = cvar.wait(should_compute).unwrap();
             }
-            *should_compute = false; // Reset flag after starting
+            *should_compute = false;
         }
 
-        // Check if paused
-        let paused = *shared.paused.lock().unwrap();
-        if paused {
-            continue;
-        }
-
-        // Get current step and board height
+        // Get current step and board dimensions
         let current_step = *shared.current_step.lock().unwrap();
-        let board_height = shared.board.lock().unwrap().height;
+        let (board_width, board_height) = {
+            let board = shared.board.lock().unwrap();
+            (board.width, board.height)
+        };
 
-        // Check if board is complete
+        // Check if board is complete - if so, start a new one
         if current_step >= board_height {
-            // Board is complete, prepare for transition
-            let computed_board = shared.board.lock().unwrap().clone();
+            // Generate new board with random seed
+            let mut rng = rand::thread_rng();
+            let new_seed_length = rng.gen_range(10..=board_width);
+            let new_board = Board::new_with_random_seed(board_width, board_height, new_seed_length);
 
-            *shared.next_board.lock().unwrap() = Some(computed_board);
-            *shared.transition_start.lock().unwrap() = Some(Instant::now());
-            *shared.transition_progress.lock().unwrap() = 0.0;
-
-            // Notify main thread that computation is complete
-            let _ = proxy.send_event(UserEvent::ComputeComplete);
+            *shared.board.lock().unwrap() = new_board;
+            *shared.current_step.lock().unwrap() = 1;
+            
+            // Don't compute yet, wait for next signal
             continue;
         }
 
@@ -239,17 +225,18 @@ fn compute_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
 
         // Update current step
         *shared.current_step.lock().unwrap() = end_step;
-
-        // Notify main thread to render
-        let _ = proxy.send_event(UserEvent::StepComplete);
     }
 }
 
-fn render_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
+fn render_worker(
+    shared: Arc<SharedState>,
+    render_cv: Arc<(Mutex<bool>, Condvar)>,
+    proxy: EventLoopProxy<UserEvent>,
+) {
     loop {
-        // Wait for signal to start rendering
+        // Wait for signal to render
         {
-            let (lock, cvar) = &*shared.render_cv;
+            let (lock, cvar) = &*render_cv;
             let mut should_render = lock.lock().unwrap();
             while !*should_render {
                 should_render = cvar.wait(should_render).unwrap();
@@ -257,80 +244,32 @@ fn render_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             *should_render = false;
         }
 
-        // Get current transition progress
-        let progress = *shared.transition_progress.lock().unwrap();
-
-        // Build the scene - use interpolation to blend colors more efficiently
+        // Build scene from current board state
         let scene = {
             let board = shared.board.lock().unwrap();
-            let next_board = shared.next_board.lock().unwrap();
-
             let mut scene = Scene::new();
 
-            // Helper to linearly interpolate between two colors
-            let lerp_color = |c1: Color, c2: Color, t: f64| -> Color {
-                let t = t.clamp(0.0, 1.0);
-                Color::rgb(
-                    c1.r as f64 / 255.0 * (1.0 - t) + c2.r as f64 / 255.0 * t,
-                    c1.g as f64 / 255.0 * (1.0 - t) + c2.g as f64 / 255.0 * t,
-                    c1.b as f64 / 255.0 * (1.0 - t) + c2.b as f64 / 255.0 * t,
-                )
-            };
-
-            // Draw cells with interpolated colors
-            if let Some(ref next) = *next_board {
-                for (row_idx, (curr_row, next_row)) in
-                    board.cells.iter().zip(next.cells.iter()).enumerate()
-                {
-                    for (col_idx, (&curr_cell, &next_cell)) in
-                        curr_row.iter().zip(next_row.iter()).enumerate()
-                    {
-                        let x = col_idx as f64 * CELL_SIZE;
-                        let y = row_idx as f64 * CELL_SIZE;
-                        let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
-
-                        let color = lerp_color(curr_cell.color(), next_cell.color(), progress);
-
-                        scene.fill(
-                            vello::peniko::Fill::NonZero,
-                            vello::kurbo::Affine::IDENTITY,
-                            color,
-                            None,
-                            &rect,
-                        );
-                    }
-                }
-            } else {
-                // No transition, just draw current board
-                for (row_idx, row) in board.cells.iter().enumerate() {
-                    for (col_idx, &cell) in row.iter().enumerate() {
-                        let x = col_idx as f64 * CELL_SIZE;
-                        let y = row_idx as f64 * CELL_SIZE;
-                        let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
-                        scene.fill(
-                            vello::peniko::Fill::NonZero,
-                            vello::kurbo::Affine::IDENTITY,
-                            cell.color(),
-                            None,
-                            &rect,
-                        );
-                    }
+            // Draw cells
+            for (row_idx, row) in board.cells.iter().enumerate() {
+                for (col_idx, &cell) in row.iter().enumerate() {
+                    let x = col_idx as f64 * CELL_SIZE;
+                    let y = row_idx as f64 * CELL_SIZE;
+                    let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
+                    scene.fill(
+                        vello::peniko::Fill::NonZero,
+                        vello::kurbo::Affine::IDENTITY,
+                        cell.color(),
+                        None,
+                        &rect,
+                    );
                 }
             }
 
             scene
         };
 
-        // Determine if transition is complete
-        let is_complete = progress >= 1.0;
-
-        // Send the built scene to the main thread
-        let render_type = if is_complete {
-            RenderType::Final(scene)
-        } else {
-            RenderType::Transition(scene)
-        };
-        let _ = proxy.send_event(UserEvent::RenderComplete(render_type));
+        // Notify main thread with the scene to render
+        let _ = proxy.send_event(UserEvent::RenderComplete(scene));
     }
 }
 
@@ -338,15 +277,8 @@ fn render_worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
 // Event Types
 // ============================================================================
 
-enum RenderType {
-    Transition(Scene), // Intermediate frame during transition
-    Final(Scene),      // Final frame, transition complete
-}
-
 enum UserEvent {
-    ComputeComplete,
-    StepComplete,
-    RenderComplete(RenderType),
+    RenderComplete(Scene),
 }
 
 // ============================================================================
@@ -355,52 +287,35 @@ enum UserEvent {
 
 struct App {
     shared: Arc<SharedState>,
+    proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     render_cx: Option<RenderContext>,
     render_surface: Option<RenderSurface<'static>>,
     renderer: Option<Renderer>,
-    scene: Option<Scene>,
+    paused: bool,
 }
 
 impl App {
-    fn new(shared: Arc<SharedState>) -> Self {
+    fn new(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) -> Self {
         App {
             shared,
+            proxy,
             window: None,
             render_cx: None,
             render_surface: None,
             renderer: None,
-            scene: None,
+            paused: false, // Start unpaused
         }
     }
 
-    fn seed_next_board_and_continue(&mut self) {
-        // Lock the board to get dimensions
-        let board_width = {
-            let board = self.shared.board.lock().unwrap();
-            board.width
-        };
-
-        // Generate a random seed length (somewhere between 10 and full width)
-        let mut rng = rand::thread_rng();
-        let new_seed_length = rng.gen_range(10..=board_width);
-
-        // Reset seed length tracker and current step
-        *self.shared.seed_length.lock().unwrap() = new_seed_length;
-        *self.shared.current_step.lock().unwrap() = 1; // Reset to step 1
-
-        // Create a new board with a random seed
-        let new_board = Board::new_with_random_seed(board_width, BOARD_HEIGHT, new_seed_length);
-
-        // Update shared state
-        *self.shared.board.lock().unwrap() = new_board;
-
-        // Signal compute thread to continue
-        {
-            let (lock, cvar) = &*self.shared.compute_cv;
-            let mut should_compute = lock.lock().unwrap();
-            *should_compute = true;
-            cvar.notify_one();
+    fn request_compute_and_redraw(&self) {
+        // Signal compute thread
+        let (lock, cvar) = &*self.shared.compute_cv;
+        *lock.lock().unwrap() = true;
+        cvar.notify_one();
+        // Request window redraw
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 }
@@ -445,10 +360,21 @@ impl ApplicationHandler<UserEvent> for App {
         )
         .expect("failed to create renderer");
 
-        self.window = Some(window);
+        // Start render thread
+        let render_shared = Arc::clone(&self.shared);
+        let render_cv = Arc::clone(&self.shared.render_cv);
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            render_worker(render_shared, render_cv, proxy);
+        });
+
+        self.window = Some(window.clone());
         self.render_cx = Some(render_cx);
         self.render_surface = Some(render_surface);
         self.renderer = Some(renderer);
+
+        // Start rendering immediately since we begin unpaused
+        self.request_compute_and_redraw();
     }
 
     fn window_event(
@@ -462,45 +388,15 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                // Present the current scene when redraw is requested
-                if let Some(scene) = self.scene.clone() {
-                    if let Some(window) = &self.window {
-                        window.pre_present_notify();
-
-                        if let (Some(renderer), Some(surface), Some(render_cx)) = (
-                            &mut self.renderer,
-                            &mut self.render_surface,
-                            &self.render_cx,
-                        ) {
-                            let device = &render_cx.devices[surface.dev_id].device;
-                            let queue = &render_cx.devices[surface.dev_id].queue;
-
-                            let width = surface.config.width;
-                            let height = surface.config.height;
-                            let surface_texture = surface
-                                .surface
-                                .get_current_texture()
-                                .expect("failed to get surface texture");
-
-                            renderer
-                                .render_to_surface(
-                                    device,
-                                    queue,
-                                    &scene,
-                                    &surface_texture,
-                                    &vello::RenderParams {
-                                        base_color: Color::WHITE,
-                                        width,
-                                        height,
-                                        antialiasing_method: AaConfig::Area,
-                                    },
-                                )
-                                .expect("failed to render to surface");
-
-                            surface_texture.present();
-                        }
-                    }
+                // Ignore if paused
+                if self.paused {
+                    return;
                 }
+
+                // Signal render thread to build scene
+                let (lock, cvar) = &*self.shared.render_cv;
+                *lock.lock().unwrap() = true;
+                cvar.notify_one();
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -513,19 +409,12 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 // Space bar: work only while pressed
                 let should_work = state == ElementState::Pressed;
-                let mut paused = self.shared.paused.lock().unwrap();
-                let was_paused = *paused;
-                *paused = !should_work;
-                drop(paused);
+                let was_paused = self.paused;
+                self.paused = !should_work;
 
                 if was_paused && should_work {
-                    // Just started: signal compute to start
-                    {
-                        let (lock, cvar) = &*self.shared.compute_cv;
-                        let mut should_compute = lock.lock().unwrap();
-                        *should_compute = true;
-                        cvar.notify_one();
-                    }
+                    // Just unpaused: request compute and redraw
+                    self.request_compute_and_redraw();
                 }
             }
             WindowEvent::Resized(size) => {
@@ -541,68 +430,48 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::StepComplete => {
-                // Render current state
-                {
-                    let (lock, cvar) = &*self.shared.render_cv;
-                    let mut should_render = lock.lock().unwrap();
-                    *should_render = true;
-                    cvar.notify_one();
-                }
+            UserEvent::RenderComplete(scene) => {
+                // Render scene to surface and present
+                if let Some(window) = &self.window {
+                    window.pre_present_notify();
 
-                // Continue computing if not paused
-                let paused = *self.shared.paused.lock().unwrap();
-                if !paused {
-                    let (lock, cvar) = &*self.shared.compute_cv;
-                    let mut should_compute = lock.lock().unwrap();
-                    *should_compute = true;
-                    cvar.notify_one();
-                }
-            }
-            UserEvent::ComputeComplete => {
-                // Set progress to 1.0 for instant transition
-                *self.shared.transition_progress.lock().unwrap() = 1.0;
+                    if let (Some(renderer), Some(surface), Some(render_cx)) = (
+                        &mut self.renderer,
+                        &mut self.render_surface,
+                        &self.render_cx,
+                    ) {
+                        let device = &render_cx.devices[surface.dev_id].device;
+                        let queue = &render_cx.devices[surface.dev_id].queue;
 
-                // Signal render thread to render the final frame
-                {
-                    let (lock, cvar) = &*self.shared.render_cv;
-                    let mut should_render = lock.lock().unwrap();
-                    *should_render = true;
-                    cvar.notify_one();
-                }
-            }
-            UserEvent::RenderComplete(render_type) => {
-                match render_type {
-                    RenderType::Transition(scene) => {
-                        // Progressive rendering: just display current state
-                        self.scene = Some(scene);
+                        let width = surface.config.width;
+                        let height = surface.config.height;
+                        let surface_texture = surface
+                            .surface
+                            .get_current_texture()
+                            .expect("failed to get surface texture");
 
-                        if let Some(window) = &self.window {
-                            window.request_redraw();
-                        }
+                        renderer
+                            .render_to_surface(
+                                device,
+                                queue,
+                                &scene,
+                                &surface_texture,
+                                &vello::RenderParams {
+                                    base_color: Color::WHITE,
+                                    width,
+                                    height,
+                                    antialiasing_method: AaConfig::Area,
+                                },
+                            )
+                            .expect("failed to render to surface");
+
+                        surface_texture.present();
                     }
-                    RenderType::Final(scene) => {
-                        // Store the final scene
-                        self.scene = Some(scene);
+                }
 
-                        // Request window redraw to present it
-                        if let Some(window) = &self.window {
-                            window.request_redraw();
-                        }
-
-                        // Transition complete, swap boards
-                        if let Some(next) = self.shared.next_board.lock().unwrap().take() {
-                            *self.shared.board.lock().unwrap() = next;
-                        }
-                        *self.shared.transition_start.lock().unwrap() = None;
-                        *self.shared.transition_progress.lock().unwrap() = 0.0;
-
-                        // Now seed the next board and signal compute to continue
-                        let paused = *self.shared.paused.lock().unwrap();
-                        if !paused {
-                            self.seed_next_board_and_continue();
-                        }
-                    }
+                // Request next frame if not paused
+                if !self.paused {
+                    self.request_compute_and_redraw();
                 }
             }
         }
@@ -622,20 +491,12 @@ fn main() {
 
     // Start compute thread
     let compute_shared = Arc::clone(&shared);
-    let compute_proxy = proxy.clone();
     thread::spawn(move || {
-        compute_worker(compute_shared, compute_proxy);
+        compute_worker(compute_shared);
     });
 
-    // Start render thread
-    let render_shared = Arc::clone(&shared);
-    let render_proxy = proxy.clone();
-    thread::spawn(move || {
-        render_worker(render_shared, render_proxy);
-    });
-
-    // Run application
-    let mut app = App::new(shared);
+    // Run application (render thread will be started in resumed())
+    let mut app = App::new(shared, proxy);
     event_loop
         .run_app(&mut app)
         .expect("failed to run event loop");
