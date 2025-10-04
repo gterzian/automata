@@ -115,9 +115,6 @@
 > OK so the TLA+ spec is correct!
 
 ### Final Verification
-
-> **gterzian**: Ok so keep the logic as per the TLA+ spec, and when you reach the full board, just keep running with a random seed at each run(so go back to what it was before). I think if you keep running the same automata you just get stuck in some long column that is the same.
-
 > **gterzian**: Ok great. One last thing: earlier you wrote the TLA+ spec is a simplified version; I don't think it is: there are just two cases in the rule where the state of a cell changes, so that's what the spec encodes. Review the spec for correctness in it's encoding of rule 110
 
 > **Copilot**: You're absolutely correct! The TLA+ spec is **not** simplified - it's actually an elegant and correct encoding of Rule 110.
