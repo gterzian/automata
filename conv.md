@@ -212,24 +212,6 @@
 > This way the flag properly controls the compute/render alternation. Thanks for catching this - it's a good reminder to think through the full state machine and timing of these synchronization primitives!
 
 ### Parallel Computation Simplification
-
-> **gterzian**: Pay close attention to my instructions: I wrote update cells from left to right, you're doing the opposite. Also, you're using `update_cell` but on a column. Finally, and this perhaps was not clear, I want you to first try to update all the cells in a row of a column, and then continue down. The TLA spec tells you what are the conditions to update an individual cell. Follow the constraints of the spec.
-
-> **Copilot**: You're absolutely right, I apologize for the confusion. Let me fix this carefully:
->
-> 1. **Left to right** (not right to left) - lower column indices to higher
-> 2. **Row by row within each column** - try to update all cells in a row across the column range, then move down
-> 3. **Follow TLA spec constraints** - only update when neighbors are available
->
-> [implements correct version]
->
-> Perfect! Now the implementation correctly:
->
-> 1. **Processes left to right**: `for cell in start_col..end_col` goes from lower to higher column indices
-> 2. **Row by row**: The outer loop is `for step in 1..board_height`, so we go down row by row
-> 3. **Within each row**: We try to update all cells in the thread's column range before moving to the next row
-> 4. **Respects TLA spec**: The `update_cell` function checks if neighbors are available (not `None`) and only updates if the preconditions are met
-
 > **gterzian**: Ok we're going to change the flow a bit. So, let's use only one thread for the compute, and forget about the splitting of the work into columns.
 
 ## Rendering Strategy
