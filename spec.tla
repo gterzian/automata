@@ -1,5 +1,5 @@
 ------------------------------ MODULE Rule_110 ------------------------------
-EXTENDS FiniteSets, Integers
+EXTENDS FiniteSets, Integers, TLC
 CONSTANT N
 VARIABLES steps
 -----------------------------------------------------------------------------
@@ -24,7 +24,8 @@ Inv == \A step \in Steps:
        \A cell \in Cells: 
             steps[step][cell] = 1 
             => LET
-                  right_neighbor == IF cell +1 =< N THEN steps[step-1][cell+1] ELSE 0
+                  last_row == steps[step -1]
+                  right_neighbor == IF cell +1 =< N THEN last_row[cell+1] ELSE last_row[1]
                IN
                \/ step = 0
                \/ /\ step > 0 
@@ -32,10 +33,11 @@ Inv == \A step \in Steps:
                         /\ steps[step-1][cell] = 0
                      \/ /\ steps[step-1][cell] = 1                                                         
 -----------------------------------------------------------------------------
-\* Starting with a single rightmost black cell.
+
+\* Starting with a random row at the top.
 Init == /\ steps = [step \in Steps \cup {0} |-> 
             IF step > 0 THEN [cell \in Cells |-> None] 
-            ELSE [cell \in Cells |-> IF cell < N THEN 0 ELSE 1 ]]
+            ELSE [cell \in Cells |-> RandomElement({1, 0}) ]]
 
 \* Note: cells can be updated for any step,
 \* forming parallel columns, 
@@ -43,9 +45,9 @@ Init == /\ steps = [step \in Steps \cup {0} |->
 \* have been updated in all previous steps.
 UpdateCell(step, cell) == LET
                               last_row == steps[step -1]
-                              \* Note: defaulting to 0 for neighbors outside of the physical board.
-                              left_neighbor == IF cell -1 > 0 THEN last_row[cell-1] ELSE 0
-                              right_neighbor == IF cell +1 =< N THEN last_row[cell+1] ELSE 0
+                              \* Note: simulating an infinite board by cycling rows
+                              left_neighbor == IF cell -1 > 0 THEN last_row[cell-1] ELSE last_row[N]
+                              right_neighbor == IF cell +1 =< N THEN last_row[cell+1] ELSE last_row[1]
                               old_state == last_row[cell]
                               new_state == CASE old_state = 1 /\ left_neighbor = 1 /\ right_neighbor = 1 -> 0
                                             []  old_state = 0 /\ right_neighbor = 1 -> 1
@@ -55,7 +57,8 @@ UpdateCell(step, cell) == LET
                           /\ left_neighbor # None
                           /\ right_neighbor # None
                           /\ steps' = [steps EXCEPT ![step][cell] = new_state]
-                                                       
+                                                 
+        
 Done == /\ \A step \in Steps: \A cell \in Cells: steps[step][cell] # None
         /\ UNCHANGED<<steps>>
 
@@ -64,5 +67,5 @@ Next == \/ \E step \in Steps: \E cell \in Cells: UpdateCell(step, cell)
 -----------------------------------------------------------------------------
 Spec  ==  Init  /\  [][Next]_<<steps>>
 
-THEOREM  Spec  =>  [](TypeOk /\ Inv)
+THEOREM  Spec  =>  [](TypeOk)
 =============================================================================

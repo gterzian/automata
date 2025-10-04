@@ -3,8 +3,8 @@
 // Displays the evolution of a 1D Rule 110 cellular automaton as a 2D history.
 // - Press and hold SPACE to compute and render (10 rows per frame)
 // - Release SPACE to pause
-// - Each board starts with a random seed pattern
-// - Automatically restarts with new random seed when board is complete
+// - Board starts with a random row and evolves infinitely
+// - When the board fills up, it scrolls down (shifts up) and continues computing
 
 use rand::Rng;
 use std::sync::{Arc, Condvar, Mutex};
@@ -53,13 +53,15 @@ struct Board {
 impl Board {
     fn new(width: usize, height: usize) -> Self {
         let mut cells = vec![vec![CellState::None; width]; height];
-        // Init: starting with a single rightmost black cell in the first row
+        let mut rng = rand::thread_rng();
+
+        // Init: starting with random 0s and 1s in the first row (as per spec)
         cells[0] = (0..width)
-            .map(|cell| {
-                if cell < width - 1 {
-                    CellState::Zero
-                } else {
+            .map(|_| {
+                if rng.gen::<bool>() {
                     CellState::One
+                } else {
+                    CellState::Zero
                 }
             })
             .collect();
@@ -71,31 +73,18 @@ impl Board {
         }
     }
 
-    fn new_with_random_seed(width: usize, height: usize, seed_length: usize) -> Self {
-        let mut cells = vec![vec![CellState::None; width]; height];
-        let mut rng = rand::thread_rng();
+    // Shift all rows up by the specified amount (discard top rows, add None rows at bottom)
+    fn shift_up(&mut self, rows: usize) {
+        let shift_amount = rows.min(self.height);
 
-        let actual_seed_length = seed_length.min(width);
-        let start_pos = width - actual_seed_length;
-
-        // White padding on left
-        for i in 0..start_pos {
-            cells[0][i] = CellState::Zero;
+        // Shift rows up
+        for row in shift_amount..self.height {
+            self.cells[row - shift_amount] = self.cells[row].clone();
         }
 
-        // Random seed on the right
-        for i in start_pos..width {
-            cells[0][i] = if rng.gen::<bool>() {
-                CellState::One
-            } else {
-                CellState::Zero
-            };
-        }
-
-        Board {
-            cells,
-            width,
-            height,
+        // Add new empty rows at bottom
+        for row in (self.height - shift_amount)..self.height {
+            self.cells[row] = vec![CellState::None; self.width];
         }
     }
 }
@@ -130,6 +119,7 @@ impl SharedState {
 // 1. (1,1,1) → 0
 // 2. (?,0,1) → 1
 // 3. OTHER → preserve state
+// Note: Using cyclic boundaries - wraps around at edges
 fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
     if step == 0 || board.cells[step][cell] != CellState::None {
         return false;
@@ -137,16 +127,17 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
 
     let last_row = &board.cells[step - 1];
 
+    // Cyclic boundaries: wrap around at edges
     let left_neighbor = if cell > 0 {
         last_row[cell - 1]
     } else {
-        CellState::Zero
+        last_row[board.width - 1]
     };
 
     let right_neighbor = if cell + 1 < board.width {
         last_row[cell + 1]
     } else {
-        CellState::Zero
+        last_row[0]
     };
 
     let old_state = last_row[cell];
@@ -193,21 +184,21 @@ fn compute_worker(shared: Arc<SharedState>) {
 
         // Get current step and board dimensions
         let current_step = *shared.current_step.lock().unwrap();
-        let (board_width, board_height) = {
+        let (_board_width, board_height) = {
             let board = shared.board.lock().unwrap();
             (board.width, board.height)
         };
 
-        // Check if board is complete - if so, start a new one
+        // Check if board is complete - if so, scroll it down by shifting up
         if current_step >= board_height {
-            // Generate new board with random seed
-            let mut rng = rand::thread_rng();
-            let new_seed_length = rng.gen_range(10..=board_width);
-            let new_board = Board::new_with_random_seed(board_width, board_height, new_seed_length);
+            // Shift board up by STEPS_PER_FRAME rows (discard top rows, continue evolution at bottom)
+            let mut board = shared.board.lock().unwrap();
+            board.shift_up(STEPS_PER_FRAME);
+            drop(board);
 
-            *shared.board.lock().unwrap() = new_board;
-            *shared.current_step.lock().unwrap() = 1;
-            
+            // Continue computing from where we left off (accounting for the shift)
+            *shared.current_step.lock().unwrap() = board_height - STEPS_PER_FRAME;
+
             // Don't compute yet, wait for next signal
             continue;
         }
