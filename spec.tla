@@ -67,5 +67,5 @@ Next == \/ \E step \in Steps: \E cell \in Cells: UpdateCell(step, cell)
 -----------------------------------------------------------------------------
 Spec  ==  Init  /\  [][Next]_<<steps>>
 
-THEOREM  Spec  =>  [](TypeOk)
+THEOREM  Spec  =>  [](Inv /\ TypeOk)
 =============================================================================
