@@ -392,7 +392,7 @@ impl ApplicationHandler<UserEvent> for App {
         if event_loop.exiting() {
             return;
         }
-        
+
         match event {
             WindowEvent::CloseRequested => {
                 // Signal worker to exit
@@ -401,7 +401,7 @@ impl ApplicationHandler<UserEvent> for App {
                 *state = SceneState::Exit;
                 cvar.notify_one();
                 drop(state);
-                
+
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
@@ -457,7 +457,7 @@ impl ApplicationHandler<UserEvent> for App {
         if event_loop.exiting() {
             return;
         }
-        
+
         match event {
             UserEvent::RenderComplete => {
                 // Render scene to surface and present
