@@ -339,14 +339,16 @@ Later refinement:
 
 ## Final Architecture
 
-The final system implements:
-- Single-threaded sequential compute (10 rows per frame)
-- Scene building in render thread with board lock held
-- GPU presentation on main thread
-- Cyclic boundaries matching TLA+ spec
-- Infinite scrolling by shifting STEPS_PER_FRAME rows
-- Pause state tracked only on main thread
-- Event-driven rendering via RedrawRequested
+The final optimized system implements:
+- **Two-thread architecture**: Main thread (event loop + GPU rendering), worker thread (compute + scene building)
+- **Circular buffer**: O(1) board scrolling using row_offset instead of cloning rows
+- **Scene reuse**: Single Scene allocated per worker, cleared with reset() each frame
+- **Pull-based rendering**: RedrawRequested triggers worker, which sends RenderComplete
+- **Board**: 3x wider than visible (1200×300), renders middle third (400×300)
+- **Cyclic boundaries**: Wrapping at edges per TLA+ spec
+- **Infinite scrolling**: Shifts by STEPS_PER_FRAME (10 rows) when full
+- **Named thread**: "worker" for debugging/profiling
+- **Minimal dependencies**: Removed rayon and clap
 
 Flow:
 ```
