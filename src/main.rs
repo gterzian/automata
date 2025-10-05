@@ -272,12 +272,11 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             }
         }
 
-        // Put scene back as Updated and notify main thread
+        // Put scene back as Updated (main thread will be woken by user event)
         {
-            let (lock, cvar) = &*shared.work_cv;
+            let (lock, _cvar) = &*shared.work_cv;
             let mut state = lock.lock().unwrap();
             *state = SceneState::Updated(scene);
-            cvar.notify_one();
         }
         let _ = proxy.send_event(UserEvent::RenderComplete);
     }
@@ -416,8 +415,7 @@ impl ApplicationHandler<UserEvent> for App {
                         *state = SceneState::NeedUpdate(scene);
                         cvar.notify_one();
                     } else {
-                        // Put back whatever state it was
-                        // (likely ComputingUpdate or already NeedUpdate)
+                        unreachable!("RedrawRequested should only be called when state is Updated");
                     }
                 }
             }
