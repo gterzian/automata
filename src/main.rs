@@ -110,6 +110,7 @@ enum SceneState {
     NeedUpdate(Scene),
     ComputingUpdate,
     Updated(Scene),
+    Exit,
 }
 
 struct SharedState {
@@ -194,7 +195,7 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
     let mut current_step = 1; // Start at step 1
 
     loop {
-        // Wait for NeedUpdate state and take the scene
+        // Wait for NeedUpdate state and take the scene, or exit if requested
         let mut scene = {
             let (lock, cvar) = &*shared.work_cv;
             let mut state = lock.lock().unwrap();
@@ -202,6 +203,10 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
                 match std::mem::replace(&mut *state, SceneState::ComputingUpdate) {
                     SceneState::NeedUpdate(scene) => {
                         break scene;
+                    }
+                    SceneState::Exit => {
+                        *state = SceneState::Exit;
+                        return; // Exit worker thread
                     }
                     other => {
                         *state = other;
@@ -367,7 +372,7 @@ impl ApplicationHandler<UserEvent> for App {
             .expect("failed to spawn worker thread");
         self.worker_handle = Some(handle);
 
-        self.window = Some(window.clone());
+        self.window = Some(window);
         self.render_cx = Some(render_cx);
         self.render_surface = Some(render_surface);
         self.renderer = Some(renderer);
@@ -384,8 +389,19 @@ impl ApplicationHandler<UserEvent> for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        if event_loop.exiting() {
+            return;
+        }
+        
         match event {
             WindowEvent::CloseRequested => {
+                // Signal worker to exit
+                let (lock, cvar) = &*self.shared.work_cv;
+                let mut state = lock.lock().unwrap();
+                *state = SceneState::Exit;
+                cvar.notify_one();
+                drop(state);
+                
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
@@ -437,7 +453,11 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        if event_loop.exiting() {
+            return;
+        }
+        
         match event {
             UserEvent::RenderComplete => {
                 // Render scene to surface and present
@@ -494,6 +514,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
     }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Join worker thread on exit
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn main() {
@@ -513,8 +540,4 @@ fn main() {
     event_loop
         .run_app(&mut app)
         .expect("failed to run event loop");
-
-    // Note: Worker threads are infinite loops, so they won't naturally exit.
-    // In a real application, you'd want to add shutdown signaling.
-    // For now, the OS will clean them up when the process exits.
 }

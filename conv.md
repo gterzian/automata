@@ -407,18 +407,52 @@ Initially set up flow where RenderComplete immediately sets NeedUpdate for next 
 
 4. **Control flow matters**: Where you trigger work (RedrawRequested vs RenderComplete) fundamentally changes the system's behavior and responsiveness.
 
-## Final Architecture
+## Proper Shutdown Handling
+
+**gterzian**: "Add a `Exit` variant to the surface. When `WindowEvent::CloseRequested`, set the surface state to it, and when the worker encounters that state, it breaks out of it's main loop(exits). In `ApplicationHandler::exiting`, you can then also join on the thread. Before processing any window or user event, check `event_loop.exiting` and bail if it is."
+
+[Implements Exit variant in SceneState, clean shutdown sequence]
+
+### Shutdown Architecture
+
+**SceneState variants**:
+- `NeedUpdate(scene)` - Scene ready for worker
+- `ComputingUpdate` - Worker is computing
+- `Updated(scene)` - Scene ready to render
+- `Exit` - Signal worker to terminate
+
+**Shutdown sequence**:
+1. User closes window → `WindowEvent::CloseRequested`
+2. Main thread sets `SceneState::Exit` and notifies worker
+3. Main thread calls `event_loop.exit()`
+4. Worker wakes up, sees `Exit` state, returns from function (thread exits)
+5. Event loop eventually calls `ApplicationHandler::exiting()`
+6. Main thread joins worker thread handle (blocks until worker exits)
+7. Clean process termination
+
+**Additional safety**:
+- Event handlers check `event_loop.exiting()` at start and bail early if shutting down
+- Prevents processing events during shutdown
+
+**Why Arc<Window> is necessary**:
+- `RenderSurface<'static>` requires window to implement `WindowHandle`
+- `WindowHandle` requires `Send + Sync` for potential cross-thread access by graphics backend
+- `Rc<Window>` doesn't implement `Send + Sync`, only `Arc<Window>` does
+- Even though window is only used in main thread, API design mandates thread-safe types
+
+## Final Architecture Summary
 
 The final optimized system implements:
 - **Two-thread architecture**: Main thread (event loop + GPU rendering), worker thread (compute + scene building)
 - **Circular buffer**: O(1) board scrolling using row_offset instead of cloning rows
-- **Scene reuse**: Single Scene allocated per worker, cleared with reset() each frame
+- **Scene reuse**: Single Scene allocated, passed between threads via state machine
 - **Pull-based rendering**: RedrawRequested triggers worker, which sends RenderComplete
 - **Board**: 3x wider than visible (1200×300), renders middle third (400×300)
 - **Cyclic boundaries**: Wrapping at edges per TLA+ spec
 - **Infinite scrolling**: Shifts by STEPS_PER_FRAME (10 rows) when full
 - **Named thread**: "worker" for debugging/profiling
 - **Minimal dependencies**: Removed rayon and clap
+- **Clean shutdown**: Exit state, thread join, no resource leaks
 
 Flow:
 ```
@@ -427,3 +461,4 @@ RedrawRequested → signal render thread
 Render builds scene → RenderComplete
 Main presents → loop if not paused
 ```
+
