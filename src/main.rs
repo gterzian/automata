@@ -51,6 +51,7 @@ struct Board {
     cells: Vec<Vec<CellState>>,
     width: usize,
     height: usize,
+    row_offset: usize, // Circular buffer offset: logical row 0 maps to cells[row_offset]
 }
 
 impl Board {
@@ -73,22 +74,31 @@ impl Board {
             cells,
             width,
             height,
+            row_offset: 0,
         }
     }
 
     // Shift all rows up by the specified amount (discard top rows, add None rows at bottom)
+    // Uses circular buffer: just adjust offset and clear the newly available rows
     fn shift_up(&mut self, rows: usize) {
         let shift_amount = rows.min(self.height);
 
-        // Shift rows up
-        for row in shift_amount..self.height {
-            self.cells[row - shift_amount] = self.cells[row].clone();
+        // Clear the rows that will become the new bottom rows
+        for i in 0..shift_amount {
+            let physical_row = (self.row_offset + i) % self.height;
+            for cell in 0..self.width {
+                self.cells[physical_row][cell] = CellState::None;
+            }
         }
 
-        // Add new empty rows at bottom
-        for row in (self.height - shift_amount)..self.height {
-            self.cells[row] = vec![CellState::None; self.width];
-        }
+        // Update offset to point to new logical start (circular)
+        self.row_offset = (self.row_offset + shift_amount) % self.height;
+    }
+
+    // Get physical row index from logical row index
+    #[inline]
+    fn physical_row(&self, logical_row: usize) -> usize {
+        (self.row_offset + logical_row) % self.height
     }
 }
 
@@ -98,8 +108,7 @@ impl Board {
 
 struct SharedState {
     board: Arc<Mutex<Board>>,
-    compute_cv: Arc<(Mutex<bool>, Condvar)>,
-    render_cv: Arc<(Mutex<bool>, Condvar)>,
+    work_cv: Arc<(Mutex<bool>, Condvar)>,
     current_step: Arc<Mutex<usize>>, // Current row being computed
 }
 
@@ -107,8 +116,7 @@ impl SharedState {
     fn new(width: usize, height: usize) -> Self {
         SharedState {
             board: Arc::new(Mutex::new(Board::new(width, height))),
-            compute_cv: Arc::new((Mutex::new(false), Condvar::new())),
-            render_cv: Arc::new((Mutex::new(false), Condvar::new())),
+            work_cv: Arc::new((Mutex::new(false), Condvar::new())),
             current_step: Arc::new(Mutex::new(1)), // Start at step 1
         }
     }
@@ -124,11 +132,13 @@ impl SharedState {
 // 3. OTHER → preserve state
 // Note: Using cyclic boundaries - wraps around at edges
 fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
-    if step == 0 || board.cells[step][cell] != CellState::None {
+    let current_physical = board.physical_row(step);
+    if step == 0 || board.cells[current_physical][cell] != CellState::None {
         return false;
     }
 
-    let last_row = &board.cells[step - 1];
+    let last_physical = board.physical_row(step - 1);
+    let last_row = &board.cells[last_physical];
 
     // Cyclic boundaries: wrap around at edges
     let left_neighbor = if cell > 0 {
@@ -165,7 +175,7 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
         old_state
     };
 
-    board.cells[step][cell] = new_state;
+    board.cells[current_physical][cell] = new_state;
     true
 }
 
@@ -173,16 +183,19 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
 // Worker Threads
 // ============================================================================
 
-fn compute_worker(shared: Arc<SharedState>) {
+fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
+    // Reuse scene across frames to avoid allocations
+    let mut scene = Scene::new();
+
     loop {
-        // Wait for signal to start computing
+        // Wait for signal to start work
         {
-            let (lock, cvar) = &*shared.compute_cv;
-            let mut should_compute = lock.lock().unwrap();
-            while !*should_compute {
-                should_compute = cvar.wait(should_compute).unwrap();
+            let (lock, cvar) = &*shared.work_cv;
+            let mut should_work = lock.lock().unwrap();
+            while !*should_work {
+                should_work = cvar.wait(should_work).unwrap();
             }
-            *should_compute = false;
+            *should_work = false;
         }
 
         // Get current step and board dimensions
@@ -216,70 +229,49 @@ fn compute_worker(shared: Arc<SharedState>) {
                 update_cell(&mut board, step, cell);
             }
         }
-        drop(board);
 
         // Update current step
         *shared.current_step.lock().unwrap() = end_step;
-    }
-}
+        let current = end_step;
 
-fn render_worker(
-    shared: Arc<SharedState>,
-    render_cv: Arc<(Mutex<bool>, Condvar)>,
-    proxy: EventLoopProxy<UserEvent>,
-) {
-    loop {
-        // Wait for signal to render
-        {
-            let (lock, cvar) = &*render_cv;
-            let mut should_render = lock.lock().unwrap();
-            while !*should_render {
-                should_render = cvar.wait(should_render).unwrap();
+        // Clear scene from previous frame and rebuild
+        scene.reset();
+
+        // Calculate offsets: middle third horizontally, but from top vertically
+        let start_col = VISIBLE_BOARD_WIDTH;
+        let end_col = start_col + VISIBLE_BOARD_WIDTH;
+        let start_row = 0;
+        let end_row = VISIBLE_BOARD_HEIGHT.min(current);
+
+        // Draw the visible portion
+        for row_idx in start_row..end_row {
+            if row_idx >= board.height {
+                break;
             }
-            *should_render = false;
-        }
-
-        // Build scene from current board state (render from top of board)
-        let scene = {
-            let board = shared.board.lock().unwrap();
-            let current = *shared.current_step.lock().unwrap();
-            let mut scene = Scene::new();
-
-            // Calculate offsets: middle third horizontally, but from top vertically
-            let start_col = VISIBLE_BOARD_WIDTH;
-            let end_col = start_col + VISIBLE_BOARD_WIDTH;
-            let start_row = 0;
-            let end_row = VISIBLE_BOARD_HEIGHT.min(current);
-
-            // Draw the visible portion
-            for row_idx in start_row..end_row {
-                if row_idx >= board.cells.len() {
+            let physical_row = board.physical_row(row_idx);
+            for col_idx in start_col..end_col {
+                if col_idx >= board.width {
                     break;
                 }
-                for col_idx in start_col..end_col {
-                    if col_idx >= board.cells[row_idx].len() {
-                        break;
-                    }
-                    let cell = board.cells[row_idx][col_idx];
-                    // Render at screen coordinates (not board coordinates)
-                    let x = (col_idx - start_col) as f64 * CELL_SIZE;
-                    let y = (row_idx - start_row) as f64 * CELL_SIZE;
-                    let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
-                    scene.fill(
-                        vello::peniko::Fill::NonZero,
-                        vello::kurbo::Affine::IDENTITY,
-                        cell.color(),
-                        None,
-                        &rect,
-                    );
-                }
+                let cell = board.cells[physical_row][col_idx];
+                // Render at screen coordinates (not board coordinates)
+                let x = (col_idx - start_col) as f64 * CELL_SIZE;
+                let y = (row_idx - start_row) as f64 * CELL_SIZE;
+                let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
+                scene.fill(
+                    vello::peniko::Fill::NonZero,
+                    vello::kurbo::Affine::IDENTITY,
+                    cell.color(),
+                    None,
+                    &rect,
+                );
             }
-
-            scene
-        };
+        }
+        drop(board);
 
         // Notify main thread with the scene to render
-        let _ = proxy.send_event(UserEvent::RenderComplete(scene));
+        // Note: We need to clone the scene since we're retaining it for reuse
+        let _ = proxy.send_event(UserEvent::RenderComplete(scene.clone()));
     }
 }
 
@@ -303,6 +295,7 @@ struct App {
     render_surface: Option<RenderSurface<'static>>,
     renderer: Option<Renderer>,
     paused: bool,
+    worker_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl App {
@@ -315,18 +308,15 @@ impl App {
             render_surface: None,
             renderer: None,
             paused: false, // Start unpaused
+            worker_handle: None,
         }
     }
 
     fn request_compute_and_redraw(&self) {
-        // Signal compute thread
-        let (lock, cvar) = &*self.shared.compute_cv;
+        // Signal worker thread
+        let (lock, cvar) = &*self.shared.work_cv;
         *lock.lock().unwrap() = true;
         cvar.notify_one();
-        // Request window redraw
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
     }
 }
 
@@ -370,13 +360,16 @@ impl ApplicationHandler<UserEvent> for App {
         )
         .expect("failed to create renderer");
 
-        // Start render thread
-        let render_shared = Arc::clone(&self.shared);
-        let render_cv = Arc::clone(&self.shared.render_cv);
-        let proxy = self.proxy.clone();
-        thread::spawn(move || {
-            render_worker(render_shared, render_cv, proxy);
-        });
+        // Start worker thread (merged compute + render)
+        let worker_shared = Arc::clone(&self.shared);
+        let worker_proxy = self.proxy.clone();
+        let handle = thread::Builder::new()
+            .name("worker".to_string())
+            .spawn(move || {
+                worker(worker_shared, worker_proxy);
+            })
+            .expect("failed to spawn worker thread");
+        self.worker_handle = Some(handle);
 
         self.window = Some(window.clone());
         self.render_cx = Some(render_cx);
@@ -384,7 +377,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.renderer = Some(renderer);
 
         // Start rendering immediately since we begin unpaused
-        self.request_compute_and_redraw();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     fn window_event(
@@ -398,15 +393,10 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                // Ignore if paused
-                if self.paused {
-                    return;
+                // Signal worker to compute and build scene when we need a frame
+                if !self.paused {
+                    self.request_compute_and_redraw();
                 }
-
-                // Signal render thread to build scene
-                let (lock, cvar) = &*self.shared.render_cv;
-                *lock.lock().unwrap() = true;
-                cvar.notify_one();
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -480,7 +470,9 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Request next frame if not paused
                 if !self.paused {
-                    self.request_compute_and_redraw();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
         }
@@ -498,15 +490,14 @@ fn main() {
 
     let proxy = event_loop.create_proxy();
 
-    // Start compute thread
-    let compute_shared = Arc::clone(&shared);
-    thread::spawn(move || {
-        compute_worker(compute_shared);
-    });
-
-    // Run application (render thread will be started in resumed())
+    // Worker thread will be started in resumed()
     let mut app = App::new(shared, proxy);
+
     event_loop
         .run_app(&mut app)
         .expect("failed to run event loop");
+
+    // Note: Worker threads are infinite loops, so they won't naturally exit.
+    // In a real application, you'd want to add shutdown signaling.
+    // For now, the OS will clean them up when the process exits.
 }
