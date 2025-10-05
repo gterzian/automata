@@ -334,3 +334,84 @@ Render builds scene → RenderComplete
 Main presents → loop if not paused
 ```
 
+## Vello 0.6 Migration and Render-to-Texture Architecture
+
+**gterzian**: "Ok now I want to update to latest vello(0.6.0), and try to the render to texture part in the render worker, and then use wgpu `TextureBlitter` to blit it to the window surface in the main thread. All other architecture should remain the same"
+
+**Copilot**: Updated dependencies:
+- vello 0.3 → 0.6.0
+- wgpu 22 → 26.0.1 (to match vello's wgpu dependency)
+
+**API Changes in vello 0.6**:
+- `Color::rgb8()` → `Color::from_rgb8()`
+- `RendererOptions` removed `surface_format` field
+- `AaSupport` required explicitly
+- `render_to_texture()` takes `&TextureView` instead of `&Texture`
+
+**Architecture Changes**:
+- `SceneState::Updated` now contains `Arc<wgpu::Texture>` instead of Scene
+- Worker renders scene to texture using `renderer.render_to_texture()`
+- Main thread uses `wgpu::util::TextureBlitter` to copy texture to surface
+- Shared device/queue between threads (Arc-wrapped) to avoid cross-device texture issues
+
+**Key Implementation Details**:
+- Worker creates texture with `RENDER_ATTACHMENT | TEXTURE_BINDING | STORAGE_BINDING | COPY_SRC` usage
+- Worker calls `renderer.render_to_texture()` with texture view
+- Main thread receives `Arc<wgpu::Texture>` in `Updated` state
+- Main thread uses `TextureBlitter::copy()` to blit to surface texture
+- Single device/queue created in main thread, Arc-cloned to worker thread
+
+### Race Condition Resolution - Presenting State
+
+**gterzian**: "You're right that on start-up, if the worker sets the state to computing before redraw requested comes in, it will panic. But that doesn't happen often, I'm seeing a panic after a while only so far.
+
+Ah I know what it is: in `RenderComplete`, main thread holds a lock, and only releases it at the end(actually it drops and re-aquires it). So the worker thread could be at the top of its loop, not waiting on the condvar but waiting on the lock, and then reading `NeedUpdate` and setting is to computing, meaning that at the next redraw event it is not in `NeedUpdate` anymore.
+
+This is how to address it:
+- Add another variant to the state enum: Presenting, and in `RenderComplete`, take the state out, and replace it with `Presenting`, and drop the lock.
+- Initial state should be also `Presenting`.
+- In `RedrawRequested`, assert it is `Presenting`, and set it to `NeedUpdate`, and then notify on the condvar."
+
+**Copilot**: Implemented the Presenting state to fix the race condition. The problem was that while main thread held the lock to blit, then dropped and reacquired it to set NeedUpdate, the worker could grab the lock in between and transition to ComputingUpdate before the next RedrawRequested.
+
+**Final State Machine with Presenting**:
+- `Presenting` - Main thread is blitting/presenting, worker must wait
+- `NeedUpdate` - Ready for worker to start computing
+- `ComputingUpdate` - Worker is computing
+- `Updated(texture)` - Texture ready to blit
+- `Exit` - Signal worker to terminate
+
+**Flow**:
+1. Start: State is `Presenting`
+2. `RedrawRequested` → asserts `Presenting`, transitions to `NeedUpdate`, notifies worker
+3. Worker wakes → transitions `NeedUpdate` to `ComputingUpdate`, computes
+4. Worker finishes → transitions to `Updated(texture)`, sends `RenderComplete`
+5. `RenderComplete` → takes texture, transitions to `Presenting`, **drops lock**, then blits
+6. Next `RedrawRequested` → cycle repeats
+
+**Key Insight**: `Presenting` acts as a barrier preventing the worker from transitioning NeedUpdate while main thread is between finishing a blit and calling request_redraw(). The state remains `Presenting` during that entire window, eliminating the race condition.
+
+## Updated Final Architecture
+
+The final system with vello 0.6 implements:
+- **Two-thread architecture**: Main thread (event loop + texture blitting), worker thread (compute + scene building + rendering to texture)
+- **Render-to-texture**: Worker renders scene to wgpu texture, main thread blits to surface
+- **Shared device**: Single wgpu device/queue Arc-shared between threads
+- **TextureBlitter**: wgpu utility for efficient texture copying to surface
+- **Circular buffer**: O(1) board scrolling using row_offset
+- **Five-state machine**: Presenting, NeedUpdate, ComputingUpdate, Updated(texture), Exit
+- **Race-free**: Presenting state prevents worker from consuming NeedUpdate prematurely
+- **Board**: 3x wider than visible (1200×300), renders middle third (400×300)
+- **Cyclic boundaries**: Wrapping at edges per TLA+ spec
+- **Infinite scrolling**: Shifts by STEPS_PER_FRAME (10 rows) when full
+- **Clean shutdown**: Exit state, thread join, no resource leaks
+
+Flow:
+```
+SPACE pressed → request redraw
+RedrawRequested → set NeedUpdate + notify worker
+Worker computes → renders to texture → Updated(texture) + RenderComplete event
+RenderComplete → take texture + set Presenting + drop lock + blit to surface + present
+Loop continues via next RedrawRequested
+```
+
