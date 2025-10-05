@@ -22,8 +22,11 @@ use winit::window::{Window, WindowId};
 const CELL_SIZE: f64 = 4.0;
 const WINDOW_WIDTH: u32 = 1600;
 const WINDOW_HEIGHT: u32 = 1200;
-const BOARD_WIDTH: usize = (WINDOW_WIDTH as f64 / CELL_SIZE) as usize;
-const BOARD_HEIGHT: usize = (WINDOW_HEIGHT as f64 / CELL_SIZE) as usize;
+const VISIBLE_BOARD_WIDTH: usize = (WINDOW_WIDTH as f64 / CELL_SIZE) as usize;
+const VISIBLE_BOARD_HEIGHT: usize = (WINDOW_HEIGHT as f64 / CELL_SIZE) as usize;
+// Compute board 3x wider than visible area (but same height)
+const BOARD_WIDTH: usize = VISIBLE_BOARD_WIDTH * 3;
+const BOARD_HEIGHT: usize = VISIBLE_BOARD_HEIGHT;
 const STEPS_PER_FRAME: usize = 10; // Rows computed per frame
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +186,7 @@ fn compute_worker(shared: Arc<SharedState>) {
         }
 
         // Get current step and board dimensions
-        let current_step = *shared.current_step.lock().unwrap();
+        let mut current_step = *shared.current_step.lock().unwrap();
         let (_board_width, board_height) = {
             let board = shared.board.lock().unwrap();
             (board.width, board.height)
@@ -199,8 +202,9 @@ fn compute_worker(shared: Arc<SharedState>) {
             // Continue computing from where we left off (accounting for the shift)
             *shared.current_step.lock().unwrap() = board_height - STEPS_PER_FRAME;
 
-            // Don't compute yet, wait for next signal
-            continue;
+            // Update current_step for the computation below
+            current_step = board_height - STEPS_PER_FRAME;
+            // Fall through to compute the new rows immediately
         }
 
         // Compute next STEPS_PER_FRAME steps
@@ -235,16 +239,31 @@ fn render_worker(
             *should_render = false;
         }
 
-        // Build scene from current board state
+        // Build scene from current board state (render from top of board)
         let scene = {
             let board = shared.board.lock().unwrap();
+            let current = *shared.current_step.lock().unwrap();
             let mut scene = Scene::new();
 
-            // Draw cells
-            for (row_idx, row) in board.cells.iter().enumerate() {
-                for (col_idx, &cell) in row.iter().enumerate() {
-                    let x = col_idx as f64 * CELL_SIZE;
-                    let y = row_idx as f64 * CELL_SIZE;
+            // Calculate offsets: middle third horizontally, but from top vertically
+            let start_col = VISIBLE_BOARD_WIDTH;
+            let end_col = start_col + VISIBLE_BOARD_WIDTH;
+            let start_row = 0;
+            let end_row = VISIBLE_BOARD_HEIGHT.min(current);
+
+            // Draw the visible portion
+            for row_idx in start_row..end_row {
+                if row_idx >= board.cells.len() {
+                    break;
+                }
+                for col_idx in start_col..end_col {
+                    if col_idx >= board.cells[row_idx].len() {
+                        break;
+                    }
+                    let cell = board.cells[row_idx][col_idx];
+                    // Render at screen coordinates (not board coordinates)
+                    let x = (col_idx - start_col) as f64 * CELL_SIZE;
+                    let y = (row_idx - start_row) as f64 * CELL_SIZE;
                     let rect = RoundedRect::new(x, y, x + CELL_SIZE, y + CELL_SIZE, 0.0);
                     scene.fill(
                         vello::peniko::Fill::NonZero,
@@ -455,7 +474,6 @@ impl ApplicationHandler<UserEvent> for App {
                                 },
                             )
                             .expect("failed to render to surface");
-
                         surface_texture.present();
                     }
                 }
