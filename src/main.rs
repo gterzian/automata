@@ -106,14 +106,23 @@ impl Board {
 // Shared State & Synchronization
 // ============================================================================
 
+enum SceneState {
+    NeedUpdate(Scene),
+    ComputingUpdate,
+    Updated(Scene),
+}
+
 struct SharedState {
-    work_cv: Arc<(Mutex<bool>, Condvar)>,
+    work_cv: Arc<(Mutex<SceneState>, Condvar)>,
 }
 
 impl SharedState {
     fn new() -> Self {
         SharedState {
-            work_cv: Arc::new((Mutex::new(false), Condvar::new())),
+            work_cv: Arc::new((
+                Mutex::new(SceneState::NeedUpdate(Scene::new())),
+                Condvar::new(),
+            )),
         }
     }
 }
@@ -184,19 +193,23 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
     let mut board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
     let mut current_step = 1; // Start at step 1
 
-    // Reuse scene across frames to avoid allocations
-    let mut scene = Scene::new();
-
     loop {
-        // Wait for signal to start work
-        {
+        // Wait for NeedUpdate state and take the scene
+        let mut scene = {
             let (lock, cvar) = &*shared.work_cv;
-            let mut should_work = lock.lock().unwrap();
-            while !*should_work {
-                should_work = cvar.wait(should_work).unwrap();
+            let mut state = lock.lock().unwrap();
+            loop {
+                match std::mem::replace(&mut *state, SceneState::ComputingUpdate) {
+                    SceneState::NeedUpdate(scene) => {
+                        break scene;
+                    }
+                    other => {
+                        *state = other;
+                        state = cvar.wait(state).unwrap();
+                    }
+                }
             }
-            *should_work = false;
-        }
+        };
 
         // Check if board is complete - if so, scroll it down by shifting up
         if current_step >= board.height {
@@ -254,9 +267,14 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             }
         }
 
-        // Notify main thread with the scene to render
-        // Note: We need to clone the scene since we're retaining it for reuse
-        let _ = proxy.send_event(UserEvent::RenderComplete(scene.clone()));
+        // Put scene back as Updated and notify main thread
+        {
+            let (lock, cvar) = &*shared.work_cv;
+            let mut state = lock.lock().unwrap();
+            *state = SceneState::Updated(scene);
+            cvar.notify_one();
+        }
+        let _ = proxy.send_event(UserEvent::RenderComplete);
     }
 }
 
@@ -265,7 +283,7 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
 // ============================================================================
 
 enum UserEvent {
-    RenderComplete(Scene),
+    RenderComplete,
 }
 
 // ============================================================================
@@ -295,13 +313,6 @@ impl App {
             paused: false, // Start unpaused
             worker_handle: None,
         }
-    }
-
-    fn request_compute_and_redraw(&self) {
-        // Signal worker thread
-        let (lock, cvar) = &*self.shared.work_cv;
-        *lock.lock().unwrap() = true;
-        cvar.notify_one();
     }
 }
 
@@ -378,9 +389,20 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                // Signal worker to compute and build scene when we need a frame
+                // Trigger worker to compute next frame if not paused
                 if !self.paused {
-                    self.request_compute_and_redraw();
+                    let (lock, cvar) = &*self.shared.work_cv;
+                    let mut state = lock.lock().unwrap();
+                    // Only trigger if we have an Updated scene ready to work on
+                    if let SceneState::Updated(scene) =
+                        std::mem::replace(&mut *state, SceneState::ComputingUpdate)
+                    {
+                        *state = SceneState::NeedUpdate(scene);
+                        cvar.notify_one();
+                    } else {
+                        // Put back whatever state it was
+                        // (likely ComputingUpdate or already NeedUpdate)
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
@@ -398,8 +420,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.paused = !should_work;
 
                 if was_paused && should_work {
-                    // Just unpaused: request compute and redraw
-                    self.request_compute_and_redraw();
+                    // Just unpaused: request redraw to start the cycle again
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
             WindowEvent::Resized(size) => {
@@ -415,7 +439,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::RenderComplete(scene) => {
+            UserEvent::RenderComplete => {
                 // Render scene to surface and present
                 if let Some(window) = &self.window {
                     window.pre_present_notify();
@@ -425,31 +449,39 @@ impl ApplicationHandler<UserEvent> for App {
                         &mut self.render_surface,
                         &self.render_cx,
                     ) {
-                        let device = &render_cx.devices[surface.dev_id].device;
-                        let queue = &render_cx.devices[surface.dev_id].queue;
+                        // Borrow the Updated scene for rendering and keep it as Updated
+                        let (lock, _cvar) = &*self.shared.work_cv;
+                        let state = lock.lock().unwrap();
 
-                        let width = surface.config.width;
-                        let height = surface.config.height;
-                        let surface_texture = surface
-                            .surface
-                            .get_current_texture()
-                            .expect("failed to get surface texture");
+                        if let SceneState::Updated(ref scene) = *state {
+                            let device = &render_cx.devices[surface.dev_id].device;
+                            let queue = &render_cx.devices[surface.dev_id].queue;
 
-                        renderer
-                            .render_to_surface(
-                                device,
-                                queue,
-                                &scene,
-                                &surface_texture,
-                                &vello::RenderParams {
-                                    base_color: Color::WHITE,
-                                    width,
-                                    height,
-                                    antialiasing_method: AaConfig::Area,
-                                },
-                            )
-                            .expect("failed to render to surface");
-                        surface_texture.present();
+                            let width = surface.config.width;
+                            let height = surface.config.height;
+                            let surface_texture = surface
+                                .surface
+                                .get_current_texture()
+                                .expect("failed to get surface texture");
+
+                            renderer
+                                .render_to_surface(
+                                    device,
+                                    queue,
+                                    scene,
+                                    &surface_texture,
+                                    &vello::RenderParams {
+                                        base_color: Color::WHITE,
+                                        width,
+                                        height,
+                                        antialiasing_method: AaConfig::Area,
+                                    },
+                                )
+                                .expect("failed to render to surface");
+                            surface_texture.present();
+                        } else {
+                            panic!("Expected Updated state in RenderComplete");
+                        }
                     }
                 }
 

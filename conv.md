@@ -337,6 +337,76 @@ Later refinement:
 >
 > This creates a smoother scrolling effect that matches the compute step granularity - each time the board fills, it scrolls by exactly one compute step's worth of rows.
 
+## Eliminating Scene Cloning and Final State Machine
+
+**gterzian**: "Ok so since you're re-using the scene, do you need to keep the entire computed board in memory?"
+
+**Copilot**: Good point! Actually, we already only keep VISIBLE_BOARD_HEIGHT rows since BOARD_HEIGHT = VISIBLE_BOARD_HEIGHT. The memory is already optimal.
+
+**gterzian**: "do you need to clone the scene to send it to the main thread? Is that not something to add to the shared state instead?"
+
+**Copilot**: Great catch! We're cloning the Scene on every frame. We can put it in SharedState protected by Mutex instead.
+
+[Implements Scene in SharedState with Mutex, eliminates clone]
+
+**gterzian**: "so put an `Option<Scene>` in `work_cv`, and use that to also replace the 'should work' boolean."
+
+**Copilot**: Excellent! We can use `Option<Scene>` to serve dual purpose: None = idle, Some = work ready.
+
+[Implements Option<Scene> but gets the logic wrong initially]
+
+**User reports panic**: `called Option::unwrap() on a None value`
+
+**Copilot's first mistake**: I thought the logic should be None = scene being worked on, Some = scene ready. But I got confused about when to set what, leading to the panic.
+
+**gterzian**: "No so the problem is the worker goes back to the beginning of the loop and then takes the scene again, so if the render event is received you can't be sure the scene is some. We need to do more than use an option around the scene, rather we need an enum with three variants: NeedUpdate(scene), ComputingUpdate, Updated(scene)."
+
+**Copilot's second mistake**: I identified that there was a race condition, but I misdiagnosed it. I thought it was about the main thread rendering before the scene was ready, but the real issue was that the worker would immediately loop back and consume the scene again before the main thread could render it. The user correctly identified we need a proper three-state machine.
+
+[Implements SceneState enum but makes corrupted edit that destroys the file]
+
+**Copilot's third mistake**: During one of my multi_replace_string_in_file calls, I made a catastrophic error that corrupted the entire file structure, replacing import statements with handler code. Had to git checkout to recover.
+
+[After recovery, carefully implements SceneState properly]
+
+Initially set up flow where RenderComplete immediately sets NeedUpdate for next frame, making worker compute continuously.
+
+**gterzian**: "only start the compute when RedrawRequested comes in, and only if not paused. This means RenderComplete should just keep the lock and use the scene, not set it immediately to NeedUpdate. Also, we want to re-use the same scene (make sure to reset it)."
+
+**Copilot's fourth mistake**: I had the trigger point wrong. I thought the worker should be signaled after rendering completes, but actually RedrawRequested should be the trigger point for compute. This gives better control over pausing and synchronizes compute with display refresh.
+
+[Implements correct flow: RedrawRequested triggers compute by setting NeedUpdate]
+
+### Final State Machine
+
+**States**:
+- `NeedUpdate(scene)` - Scene ready for worker to compute into
+- `ComputingUpdate` - Worker is currently computing
+- `Updated(scene)` - Scene has new frame, ready to render
+
+**Flow**:
+1. **Initialization**: State = `NeedUpdate(Scene::new())` - single scene created
+2. **RedrawRequested** (if not paused): Takes `Updated(scene)` → sets `NeedUpdate(scene)` → signals worker
+3. **Worker**: Waits for `NeedUpdate(scene)` → sets `ComputingUpdate` → calls `scene.reset()` → computes and builds scene → sets `Updated(scene)` → sends `RenderComplete` event
+4. **RenderComplete**: Borrows `Updated(scene)` to render (keeps as `Updated`) → requests next redraw if not paused
+
+**Key properties**:
+- Single Scene allocation, reused throughout lifetime
+- No scene cloning
+- Compute triggered by RedrawRequested, synchronized with display
+- Pausing just stops requesting redraws; state stays at Updated
+- Worker waits idly when paused (no wasted computation)
+
+### Lessons from Mistakes
+
+1. **Race conditions are subtle**: I correctly identified there was a race, but misunderstood what was racing. The real issue was the worker immediately re-consuming the scene, not the timing of main thread access.
+
+2. **State machines need all states explicit**: Trying to use `Option<Scene>` or boolean flags leads to ambiguous states and race conditions. The three-state enum makes all transitions explicit and eliminates races.
+
+3. **Multi-replace requires extreme care**: When doing complex refactorings with multi_replace_string_in_file, I need to be more careful about the search strings to avoid catastrophic mismatches.
+
+4. **Control flow matters**: Where you trigger work (RedrawRequested vs RenderComplete) fundamentally changes the system's behavior and responsiveness.
+
 ## Final Architecture
 
 The final optimized system implements:
