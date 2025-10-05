@@ -11,8 +11,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use vello::kurbo::RoundedRect;
 use vello::peniko::Color;
-use vello::util::{RenderContext, RenderSurface};
 use vello::{AaConfig, AaSupport, Renderer, RendererOptions, Scene};
+use wgpu::util::TextureBlitter;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -41,7 +41,7 @@ impl CellState {
         match self {
             CellState::Zero => Color::WHITE,
             CellState::One => Color::BLACK,
-            CellState::None => Color::rgb8(220, 220, 220), // Light grey
+            CellState::None => Color::from_rgb8(220, 220, 220), // Light grey
         }
     }
 }
@@ -107,9 +107,10 @@ impl Board {
 // ============================================================================
 
 enum SceneState {
-    NeedUpdate(Scene),
+    Presenting,
+    NeedUpdate,
     ComputingUpdate,
-    Updated(Scene),
+    Updated(Arc<wgpu::Texture>),
     Exit,
 }
 
@@ -120,10 +121,7 @@ struct SharedState {
 impl SharedState {
     fn new() -> Self {
         SharedState {
-            work_cv: Arc::new((
-                Mutex::new(SceneState::NeedUpdate(Scene::new())),
-                Condvar::new(),
-            )),
+            work_cv: Arc::new((Mutex::new(SceneState::Presenting), Condvar::new())),
         }
     }
 }
@@ -189,27 +187,43 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
 // Worker Threads
 // ============================================================================
 
-fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
+fn worker(
+    shared: Arc<SharedState>,
+    proxy: EventLoopProxy<UserEvent>,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+) {
     // Worker owns the board - no sharing needed
     let mut board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
     let mut current_step = 1; // Start at step 1
 
+    // Create renderer for worker thread using shared device
+    let mut renderer = Renderer::new(
+        &*device,
+        RendererOptions {
+            antialiasing_support: AaSupport::area_only(),
+            ..Default::default()
+        },
+    )
+    .expect("failed to create renderer");
+
+    let mut scene = Scene::new();
+
     loop {
-        // Wait for NeedUpdate state and take the scene, or exit if requested
-        let mut scene = {
+        // Wait for NeedUpdate state, or exit if requested
+        {
             let (lock, cvar) = &*shared.work_cv;
             let mut state = lock.lock().unwrap();
             loop {
-                match std::mem::replace(&mut *state, SceneState::ComputingUpdate) {
-                    SceneState::NeedUpdate(scene) => {
-                        break scene;
+                match *state {
+                    SceneState::NeedUpdate => {
+                        *state = SceneState::ComputingUpdate;
+                        break;
                     }
                     SceneState::Exit => {
-                        *state = SceneState::Exit;
                         return; // Exit worker thread
                     }
-                    other => {
-                        *state = other;
+                    _ => {
                         state = cvar.wait(state).unwrap();
                     }
                 }
@@ -272,11 +286,47 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             }
         }
 
-        // Put scene back as Updated (main thread will be woken by user event)
+        // Render scene to texture
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("render_texture"),
+            size: wgpu::Extent3d {
+                width: WINDOW_WIDTH,
+                height: WINDOW_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        renderer
+            .render_to_texture(
+                &*device,
+                &*queue,
+                &scene,
+                &texture_view,
+                &vello::RenderParams {
+                    base_color: Color::WHITE,
+                    width: WINDOW_WIDTH,
+                    height: WINDOW_HEIGHT,
+                    antialiasing_method: AaConfig::Area,
+                },
+            )
+            .expect("failed to render to texture");
+
+        // Put texture back as Updated (main thread will be woken by user event)
         {
             let (lock, _cvar) = &*shared.work_cv;
             let mut state = lock.lock().unwrap();
-            *state = SceneState::Updated(scene);
+            *state = SceneState::Updated(Arc::new(texture));
         }
         let _ = proxy.send_event(UserEvent::RenderComplete);
     }
@@ -298,9 +348,11 @@ struct App {
     shared: Arc<SharedState>,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
-    render_cx: Option<RenderContext>,
-    render_surface: Option<RenderSurface<'static>>,
-    renderer: Option<Renderer>,
+    device: Option<Arc<wgpu::Device>>,
+    queue: Option<Arc<wgpu::Queue>>,
+    surface: Option<wgpu::Surface<'static>>,
+    surface_config: Option<wgpu::SurfaceConfiguration>,
+    blitter: Option<TextureBlitter>,
     paused: bool,
     worker_handle: Option<thread::JoinHandle<()>>,
 }
@@ -311,9 +363,11 @@ impl App {
             shared,
             proxy,
             window: None,
-            render_cx: None,
-            render_surface: None,
-            renderer: None,
+            device: None,
+            queue: None,
+            surface: None,
+            surface_config: None,
+            blitter: None,
             paused: false, // Start unpaused
             worker_handle: None,
         }
@@ -336,45 +390,78 @@ impl ApplicationHandler<UserEvent> for App {
                 .expect("failed to create window"),
         );
 
-        // Initialize render context
-        let mut render_cx = RenderContext::new();
+        // Initialize wgpu
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("failed to create surface");
+
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
+        .expect("failed to get adapter");
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("main_device"),
+            required_features: wgpu::Features::default(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("failed to get device");
+
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
         let size = window.inner_size();
-        let render_surface = pollster::block_on(render_cx.create_surface(
-            window.clone(),
-            size.width,
-            size.height,
-            wgpu::PresentMode::AutoVsync,
-        ))
-        .expect("failed to create surface");
+        let surface_caps = surface.get_capabilities(&adapter);
+        let surface_format = surface_caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(surface_caps.formats[0]);
 
-        let device = &render_cx.devices[render_surface.dev_id].device;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: surface_caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
 
-        let renderer = Renderer::new(
-            device,
-            RendererOptions {
-                surface_format: Some(render_surface.format),
-                use_cpu: false,
-                antialiasing_support: AaSupport::area_only(),
-                num_init_threads: None,
-            },
-        )
-        .expect("failed to create renderer");
+        // Create TextureBlitter (takes only device and format)
+        let blitter = TextureBlitter::new(&device, surface_format);
 
-        // Start worker thread (merged compute + render)
+        // Start worker thread
         let worker_shared = Arc::clone(&self.shared);
         let worker_proxy = self.proxy.clone();
+        let worker_device = Arc::clone(&device);
+        let worker_queue = Arc::clone(&queue);
         let handle = thread::Builder::new()
             .name("worker".to_string())
             .spawn(move || {
-                worker(worker_shared, worker_proxy);
+                worker(worker_shared, worker_proxy, worker_device, worker_queue);
             })
             .expect("failed to spawn worker thread");
         self.worker_handle = Some(handle);
 
         self.window = Some(window);
-        self.render_cx = Some(render_cx);
-        self.render_surface = Some(render_surface);
-        self.renderer = Some(renderer);
+        self.device = Some(device);
+        self.queue = Some(queue);
+        self.surface = Some(surface);
+        self.surface_config = Some(config);
+        self.blitter = Some(blitter);
 
         // Start rendering immediately since we begin unpaused
         if let Some(window) = &self.window {
@@ -408,14 +495,17 @@ impl ApplicationHandler<UserEvent> for App {
                 if !self.paused {
                     let (lock, cvar) = &*self.shared.work_cv;
                     let mut state = lock.lock().unwrap();
-                    // Only trigger if we have an Updated scene ready to work on
-                    if let SceneState::Updated(scene) =
-                        std::mem::replace(&mut *state, SceneState::ComputingUpdate)
-                    {
-                        *state = SceneState::NeedUpdate(scene);
-                        cvar.notify_one();
-                    } else {
-                        unreachable!("RedrawRequested should only be called when state is Updated");
+                    // State should be Presenting when RedrawRequested is called
+                    match *state {
+                        SceneState::Presenting => {
+                            *state = SceneState::NeedUpdate;
+                            cvar.notify_one();
+                        }
+                        _ => {
+                            unreachable!(
+                                "RedrawRequested should only be called when state is Presenting"
+                            );
+                        }
                     }
                 }
             }
@@ -441,10 +531,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Resized(size) => {
-                if let (Some(render_cx), Some(render_surface)) =
-                    (&mut self.render_cx, &mut self.render_surface)
+                if let (Some(surface), Some(device), Some(config)) =
+                    (&self.surface, &self.device, &mut self.surface_config)
                 {
-                    render_cx.resize_surface(render_surface, size.width, size.height);
+                    config.width = size.width;
+                    config.height = size.height;
+                    surface.configure(device, config);
                 }
             }
             _ => {}
@@ -458,48 +550,47 @@ impl ApplicationHandler<UserEvent> for App {
 
         match event {
             UserEvent::RenderComplete => {
-                // Render scene to surface and present
+                // Blit texture to surface and present
                 if let Some(window) = &self.window {
                     window.pre_present_notify();
 
-                    if let (Some(renderer), Some(surface), Some(render_cx)) = (
-                        &mut self.renderer,
-                        &mut self.render_surface,
-                        &self.render_cx,
-                    ) {
-                        // Borrow the Updated scene for rendering and keep it as Updated
-                        let (lock, _cvar) = &*self.shared.work_cv;
-                        let state = lock.lock().unwrap();
+                    if let (Some(blitter), Some(surface), Some(device), Some(queue)) =
+                        (&self.blitter, &self.surface, &self.device, &self.queue)
+                    {
+                        // Take the texture and transition to Presenting
+                        let texture = {
+                            let (lock, _cvar) = &*self.shared.work_cv;
+                            let mut state = lock.lock().unwrap();
 
-                        if let SceneState::Updated(ref scene) = *state {
-                            let device = &render_cx.devices[surface.dev_id].device;
-                            let queue = &render_cx.devices[surface.dev_id].queue;
+                            if let SceneState::Updated(texture) =
+                                std::mem::replace(&mut *state, SceneState::Presenting)
+                            {
+                                texture
+                            } else {
+                                panic!("Expected Updated state in RenderComplete");
+                            }
+                        };
 
-                            let width = surface.config.width;
-                            let height = surface.config.height;
-                            let surface_texture = surface
-                                .surface
-                                .get_current_texture()
-                                .expect("failed to get surface texture");
+                        // Now blit without holding the lock
+                        let surface_texture = surface
+                            .get_current_texture()
+                            .expect("failed to get surface texture");
 
-                            renderer
-                                .render_to_surface(
-                                    device,
-                                    queue,
-                                    scene,
-                                    &surface_texture,
-                                    &vello::RenderParams {
-                                        base_color: Color::WHITE,
-                                        width,
-                                        height,
-                                        antialiasing_method: AaConfig::Area,
-                                    },
-                                )
-                                .expect("failed to render to surface");
-                            surface_texture.present();
-                        } else {
-                            panic!("Expected Updated state in RenderComplete");
-                        }
+                        let mut encoder =
+                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("copy_encoder"),
+                            });
+
+                        let texture_view =
+                            texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let surface_view = surface_texture
+                            .texture
+                            .create_view(&wgpu::TextureViewDescriptor::default());
+
+                        blitter.copy(&device, &mut encoder, &texture_view, &surface_view);
+
+                        queue.submit(std::iter::once(encoder.finish()));
+                        surface_texture.present();
                     }
                 }
 

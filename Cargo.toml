@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 winit = "0.30"
-vello = "0.3"
-wgpu = "22"
+vello = "0.6"
+wgpu = "26.0.1"
 pollster = "0.3"
 rand = "0.8"
