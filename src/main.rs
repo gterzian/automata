@@ -107,17 +107,13 @@ impl Board {
 // ============================================================================
 
 struct SharedState {
-    board: Arc<Mutex<Board>>,
     work_cv: Arc<(Mutex<bool>, Condvar)>,
-    current_step: Arc<Mutex<usize>>, // Current row being computed
 }
 
 impl SharedState {
-    fn new(width: usize, height: usize) -> Self {
+    fn new() -> Self {
         SharedState {
-            board: Arc::new(Mutex::new(Board::new(width, height))),
             work_cv: Arc::new((Mutex::new(false), Condvar::new())),
-            current_step: Arc::new(Mutex::new(1)), // Start at step 1
         }
     }
 }
@@ -184,6 +180,10 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
 // ============================================================================
 
 fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
+    // Worker owns the board - no sharing needed
+    let mut board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
+    let mut current_step = 1; // Start at step 1
+
     // Reuse scene across frames to avoid allocations
     let mut scene = Scene::new();
 
@@ -198,30 +198,17 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
             *should_work = false;
         }
 
-        // Get current step and board dimensions
-        let mut current_step = *shared.current_step.lock().unwrap();
-        let (_board_width, board_height) = {
-            let board = shared.board.lock().unwrap();
-            (board.width, board.height)
-        };
-
         // Check if board is complete - if so, scroll it down by shifting up
-        if current_step >= board_height {
+        if current_step >= board.height {
             // Shift board up by STEPS_PER_FRAME rows (discard top rows, continue evolution at bottom)
-            let mut board = shared.board.lock().unwrap();
             board.shift_up(STEPS_PER_FRAME);
-            drop(board);
 
             // Continue computing from where we left off (accounting for the shift)
-            *shared.current_step.lock().unwrap() = board_height - STEPS_PER_FRAME;
-
-            // Update current_step for the computation below
-            current_step = board_height - STEPS_PER_FRAME;
+            current_step = board.height - STEPS_PER_FRAME;
             // Fall through to compute the new rows immediately
         }
 
         // Compute next STEPS_PER_FRAME steps
-        let mut board = shared.board.lock().unwrap();
         let end_step = (current_step + STEPS_PER_FRAME).min(board.height);
 
         for step in current_step..end_step {
@@ -231,8 +218,7 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
         }
 
         // Update current step
-        *shared.current_step.lock().unwrap() = end_step;
-        let current = end_step;
+        current_step = end_step;
 
         // Clear scene from previous frame and rebuild
         scene.reset();
@@ -241,7 +227,7 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
         let start_col = VISIBLE_BOARD_WIDTH;
         let end_col = start_col + VISIBLE_BOARD_WIDTH;
         let start_row = 0;
-        let end_row = VISIBLE_BOARD_HEIGHT.min(current);
+        let end_row = VISIBLE_BOARD_HEIGHT.min(current_step);
 
         // Draw the visible portion
         for row_idx in start_row..end_row {
@@ -267,7 +253,6 @@ fn worker(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) {
                 );
             }
         }
-        drop(board);
 
         // Notify main thread with the scene to render
         // Note: We need to clone the scene since we're retaining it for reuse
@@ -480,7 +465,7 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
-    let shared = Arc::new(SharedState::new(BOARD_WIDTH, BOARD_HEIGHT));
+    let shared = Arc::new(SharedState::new());
 
     // Create event loop
     let event_loop = EventLoop::<UserEvent>::with_user_event()
