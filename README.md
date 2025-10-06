@@ -4,6 +4,8 @@ Displays the evolution of a 1D [Rule 110](https://mathworld.wolfram.com/Rule110.
 
 TLA+ [spec](spec.tla) written by hand; code generated as a result of a conversation [summarized here](conv.md) for technical highlights and evolution of the implementation.
 
+Supporting blog post: [TLA+ in support of AI code generation](https://medium.com/@polyglot_factotum/tla-in-support-of-ai-code-generation-9086fc9715c4)
+
 ### Features
 
 - Interactive visualization with pause/unpause controls
