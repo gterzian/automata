@@ -45,10 +45,19 @@ User decided to simplify the initial design:
 - **Parallel computation → Single-threaded**: Removed column-based parallelization with multiple worker threads competing for shared board state. Simplified to single worker thread with exclusive board ownership.
 - **Dependencies pruned**: Removed rayon (no longer needed), later re-added clap for CLI args
 
-### Key Bug Fixes
-1. **Pause/unpause synchronization**: Fixed condvar notification timing
-2. **Compute loop**: Worker was immediately setting flags that broke processing
-3. **Race condition in state machine**: Added `Presenting` state to prevent worker from consuming `NeedUpdate` prematurely
+### Key Bug Fixes (User-Identified)
+
+**gterzian**: "Don't always just listen to me, there is a bug in the setting of should compute to new paused"
+
+Fixed condvar notification timing - was notifying unnecessarily when pausing.
+
+**gterzian**: "At the beginning of the compute worker loop, there is a bug based on the logic we added. Make sure you try to prevent these kind of side effects"
+
+Fixed critical bug where worker was immediately setting `should_compute = false` after waking up, breaking the processing loop.
+
+**gterzian**: "Add another variant to the state enum: Presenting..."
+
+Added `Presenting` state to fix race condition where worker could consume `NeedUpdate` while main thread was between finishing blit and calling request_redraw.
 
 ### Infinite Scrolling
 > **gterzian**: Instead of stopping at `Done`: keep "scrolling down" by popping a compute step from the top of the board, and pushing a compute step to the bottom.
@@ -59,19 +68,68 @@ Implemented circular buffer with `row_offset` for O(1) scrolling. When board fil
 
 ## State Machine Evolution
 
-### Initial: Scene-Based
+### Episode 1: Initial Three-State Machine
+
+**Initial problem**: Scene was being cloned on every frame. User suggested putting it in shared state.
+
+**gterzian**: "do you need to clone the scene to send it to the main thread? Is that not something to add to the shared state instead?"
+
+**gterzian**: "so put an `Option<Scene>` in `work_cv`, and use that to also replace the 'should work' boolean."
+
+First attempt used `Option<Scene>` but had logic errors, leading to panics.
+
+**gterzian**: "No so the problem is the worker goes back to the beginning of the loop and then takes the scene again, so if the render event is received you can't be sure the scene is some. We need to do more than use an option around the scene, rather we need an enum with three variants: NeedUpdate(scene), ComputingUpdate, Updated(scene)."
+
+Implemented proper three-state machine:
 - `NeedUpdate(scene)` - Scene ready for worker
 - `ComputingUpdate` - Worker computing
 - `Updated(scene)` - Scene ready to render
 
-### After Vello 0.6 + Render-to-Texture
-- `Presenting` - Main thread blitting, worker must wait
-- `NeedUpdate` - Ready for worker to compute
-- `ComputingUpdate` - Worker computing
+**gterzian**: "only start the compute when RedrawRequested comes in, and only if not paused. This means RenderComplete should just keep the lock and use the scene, not set it immediately to NeedUpdate. Also, we want to re-use the same scene (make sure to reset it)."
+
+Corrected flow: trigger compute from RedrawRequested instead of RenderComplete.
+
+### Episode 2: Race Condition Discovery - Adding Presenting State
+
+After Vello 0.6 migration with render-to-texture, discovered a subtle race condition that caused occasional panics.
+
+**gterzian**: "You're right that on start-up, if the worker sets the state to computing before redraw requested comes in, it will panic. But that doesn't happen often, I'm seeing a panic after a while only so far.
+
+Ah I know what it is: in `RenderComplete`, main thread holds a lock, and only releases it at the end(actually it drops and re-aquires it). So the worker thread could be at the top of its loop, not waiting on the condvar but waiting on the lock, and then reading `NeedUpdate` and setting is to computing, meaning that at the next redraw event it is not in `NeedUpdate` anymore.
+
+This is how to address it:
+- Add another variant to the state enum: Presenting, and in `RenderComplete`, take the state out, and replace it with `Presenting`, and drop the lock.
+- Initial state should be also `Presenting`.
+- In `RedrawRequested`, assert it is `Presenting`, and set it to `NeedUpdate`, and then notify on the condvar."
+
+**The problem**: While main thread held lock to blit, then dropped and reacquired it to set NeedUpdate, the worker could grab the lock in between and transition to ComputingUpdate before the next RedrawRequested.
+
+**The solution**: Added `Presenting` state as a barrier:
+- `Presenting` - Main thread is blitting/presenting, worker must wait
+- `NeedUpdate` - Ready for worker to start computing
+- `ComputingUpdate` - Worker is computing
 - `Updated(texture)` - Texture ready to blit
 - `Exit` - Signal worker to terminate
 
-**Key change**: Worker now renders to texture, main thread uses `TextureBlitter` to blit to surface.
+**Key insight**: `Presenting` prevents worker from transitioning NeedUpdate while main thread is between finishing a blit and calling request_redraw().
+
+### Episode 3: GIF Recording - Similar Pattern in GifEncodeState
+
+When implementing GIF recording, encountered similar coordination issues.
+
+**gterzian**: "It's ok for the gif to miss frames, expected event, so add a `Encoding` variant to `GifEncodeState`, and only send a new frame if it is `Idle`."
+
+Applied same state machine pattern to coordinate worker and encoder thread:
+- `Idle` - Encoder ready to receive frame
+- `HasBuffer(Arc<wgpu::Buffer>)` - Buffer ready to process
+- `Encoding` - Processing frame
+- `Exit` - Terminal state
+
+Worker checks encoder state before capturing: only capture if `Idle`, skip frame if `Encoding`.
+
+**gterzian**: "`GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
+
+Made invariant explicit: encoder sets `Encoding` itself and transitions out before looping back, so it should be `unreachable!()` in the wait loop.
 
 ## Vello 0.6 Migration
 
@@ -142,17 +200,27 @@ Used Servo's vello_backend.rs as reference for correct API:
 - `wgpu::TexelCopyBufferLayout` (not `ImageDataLayout`)
 - `wgpu::PollType::Poll`/`::Wait` (not `Maintain` enum)
 
-### Thread Cleanup
-Hierarchical shutdown:
+### Thread Cleanup (User-Requested)
+
+**gterzian**: "keep the join handle to the encoder, join on it when you exit"
+
+**gterzian**: "Add a `Exit` variant to the surface. When `WindowEvent::CloseRequested`, set the surface state to it, and when the worker encounters that state, it breaks out of it's main loop(exits). In `ApplicationHandler::exiting`, you can then also join on the thread."
+
+Implemented hierarchical shutdown:
 1. Worker detects `SceneState::Exit`
 2. Worker signals encoder with `GifEncodeState::Exit`
 3. Worker joins encoder thread handle
 4. Clean termination
 
-### Code Quality
-- Removed unnecessary print statements (kept diagnostic warnings)
-- Made state machine invariant explicit: `Encoding` is `unreachable!()` in encoder's wait loop
-- Ordered enum variants by actual state flow
+### Code Quality (User-Requested)
+
+**gterzian**: "In the definition of an enum expressing a state machine like `GifEncodeState`, it's good practice for the variant to be, if possible, defined in the order in which they will occur in practice."
+
+Reordered enum variants to match actual state flow (Idle → HasBuffer → Encoding → Idle, Exit).
+
+**gterzian**: "remove prints(except the two re missed frame). `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
+
+Removed unnecessary print statements (kept diagnostic warnings). Made state machine invariant explicit: `Encoding` is `unreachable!()` in encoder's wait loop, enforcing that encoder should never be in `Encoding` state at loop start.
 
 ## Architecture Summary
 
