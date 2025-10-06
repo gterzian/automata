@@ -33,7 +33,6 @@ Inv == \A step \in Steps:
                         /\ steps[step-1][cell] = 0
                      \/ /\ steps[step-1][cell] = 1                                                         
 -----------------------------------------------------------------------------
-
 \* Starting with a random row at the top.
 Init == /\ steps = [step \in Steps \cup {0} |-> 
             IF step > 0 THEN [cell \in Cells |-> None] 
