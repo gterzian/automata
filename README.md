@@ -2,6 +2,8 @@
 
 Displays the evolution of a 1D [Rule 110](https://mathworld.wolfram.com/Rule110.html) cellular automaton as a 2D history.
 
+TLA+ [spec](spec.tla) written by hand; code generated as a result of a conversation [summarized here](conv.md) for technical highlights and evolution of the implementation.
+
 ### Features
 
 - Interactive visualization with pause/unpause controls
@@ -31,10 +33,6 @@ cargo run --release -- --record-gif output.gif
 ### Command-Line Arguments
 
 - `--record-gif <FILE>`: Optional path to save the visualization as a GIF file. When enabled, frames are captured and encoded in a separate thread without blocking the main visualization.
-
-### Documentation
-
-TLA+ [spec](spec.tla) written by hand; code generated as a result of a conversation [summarized here](conv.md) for technical highlights and evolution of the implementation.
 
 ### Example Output
 
