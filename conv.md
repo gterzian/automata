@@ -415,3 +415,135 @@ RenderComplete → take texture + set Presenting + drop lock + blit to surface +
 Loop continues via next RedrawRequested
 ```
 
+## GIF Recording Feature
+
+**gterzian**: "Add a command line option to save the run to a gif file, and implement it using https://docs.rs/gif/latest/gif/"
+
+**gterzian**: "But first, vendor that library and audit it for security"
+
+**Copilot**: Vendored gif crate v0.13.3 and dependencies. Conducted security audit:
+- **gif crate**: Uses `#![forbid(unsafe_code)]`, maintained by image-rs team, proper error handling - SAFE TO USE
+- Dependencies: All standard safe libraries (color_quant, weezl for LZW)
+- Conclusion: Safe to proceed with implementation
+
+**gterzian**: "Proceed, and remove `vendor`"
+
+**Copilot**: Implemented GIF recording with:
+- clap 4.5: Command-line parsing with derive feature for `--record-gif <FILE>` argument
+- gif 0.13.3: GIF encoder with palette-based encoding
+- Initial architecture: Frame capture in worker thread, blocking buffer mapping
+
+**gterzian**: "Can you not move `capture_frame_to_gif` to the worker?"
+
+**Copilot**: Moved frame capture from main thread to worker thread since worker owns the texture.
+
+### wgpu 26.0.1 API Compatibility
+
+**Issue**: Multiple compilation errors with incorrect type names:
+- `ImageCopyBuffer` doesn't exist
+- `ImageDataLayout` doesn't exist  
+- `Maintain` enum doesn't exist
+
+**gterzian**: "rad the docs https://docs.rs/wgpu/26.0.1/wgpu/util/struct.DownloadBuffer.html"
+
+**gterzian**: Provided Servo project link: "https://raw.githubusercontent.com/servo/servo/refs/heads/main/components/canvas/vello_backend.rs"
+
+**Copilot**: Used Servo's vello_backend.rs as reference to find correct wgpu 26.0.1 API:
+- Use `wgpu::TexelCopyBufferInfo` with `buffer` and `layout` fields
+- Use `wgpu::TexelCopyBufferLayout` with `offset`, `bytes_per_row`, `rows_per_image`
+- Use `wgpu::PollType::Poll` or `::Wait` (not `Maintain` enum)
+- Use `texture.as_image_copy()` for source
+
+### Non-Blocking Architecture Refactoring
+
+**gterzian**: "First of all, only do the gif stuff if the setting is on. The problem is we're not missing frames, so the `RedrawRequested` comes in while the worker is busy... So let's fix it: Move the gif part to a dedicated thread owned by the worker... Instead of panicing, print out a warning that we missed a frame"
+
+**gterzian**: "keep the join handle to the encoder, join on it when you exit. It's ok for the gif to miss frames, expected event, so add a `Encoding` variant to `GifEncodeState`, and only send a new frame if it is `Idle`. Can you not move the buffer copying to the encoder thread? I don't like how it blocks on the gpu. In any case, the worker should check the state of the `Encoding`, and only copy and send a buffer when idle"
+
+**Copilot**: Major architecture refactoring:
+
+**Three-Thread System**:
+1. **Main thread**: Event loop, texture blitting to surface, presentation
+2. **Worker thread**: Owns board state, computes evolution, builds scenes, renders to texture, coordinates GIF capture
+3. **GIF encoder thread**: Owned by worker, maps buffers, converts RGBA→grayscale, writes GIF frames
+
+**GifEncodeState State Machine**:
+- `Idle` - Encoder ready to receive next frame
+- `Encoding` - Encoder busy processing frame
+- `HasBuffer(Arc<wgpu::Buffer>)` - Buffer ready for encoder to process
+- `Exit` - Signal encoder to terminate
+
+**GifSharedState**:
+- `cv: Arc<(Mutex<GifEncodeState>, Condvar)>` - State coordination
+- `device: Arc<wgpu::Device>` - Shared device for buffer operations
+
+**Frame Capture Flow** (Non-Blocking):
+1. Worker checks if encoder is `Idle` (skip frame if not)
+2. Worker creates buffer and submits copy command to GPU
+3. Worker sends `Arc<wgpu::Buffer>` to encoder via `HasBuffer` state
+4. Worker continues immediately without blocking
+5. Encoder thread maps buffer (blocking operation isolated here)
+6. Encoder converts RGBA→grayscale indexed color
+7. Encoder writes GIF frame with 6/100s delay (~16fps)
+8. Encoder transitions back to `Idle`
+
+**Graceful Error Handling**:
+- Missed frames print warning instead of panic
+- Application continues running smoothly
+- Frame skipping is expected behavior
+
+**Proper Thread Cleanup**:
+1. Worker detects `SceneState::Exit`
+2. Worker signals encoder with `GifEncodeState::Exit`
+3. Worker joins encoder thread handle
+4. Hierarchical cleanup (worker owns encoder)
+
+**Key Implementation Details**:
+- Buffer mapping moved to encoder thread (no GPU blocking in worker)
+- State-based decision making for frame capture
+- Non-blocking architecture maintains application responsiveness
+- 256-color grayscale palette for efficient encoding
+- Successfully tested with 18MB output.gif
+
+### Final GIF Architecture
+
+The complete system with GIF recording implements:
+- **Three-thread architecture**: Main (event loop), worker (compute/render), encoder (GIF writing)
+- **Hierarchical ownership**: Worker owns encoder thread, keeps join handle
+- **Non-blocking capture**: Worker never blocks on GPU buffer mapping
+- **State-based coordination**: Two condvar-protected state machines (SceneState + GifEncodeState)
+- **Frame skipping**: Graceful handling of busy encoder, prints warnings
+- **Command-line interface**: `--record-gif <FILE>` using clap with derive feature
+- **Clean shutdown**: Signal propagation through Exit states, proper thread joins
+- **Working implementation**: Successfully tested, creates valid GIF files
+
+Dependencies added:
+- `gif = "0.13.3"` - GIF encoding
+- `clap = { version = "4.5", features = ["derive"] }` - CLI parsing
+
+### Code Quality Improvements
+
+**gterzian**: "In the definition of an enum expressing a state machine like `GifEncodeState`, it's good practice for the variant to be, if possible, defined in the order in which they will occur in practice."
+
+**Copilot**: Reordered `GifEncodeState` variants to reflect actual state flow:
+- `Idle` - Encoder ready and waiting
+- `HasBuffer(Arc<wgpu::Buffer>)` - Buffer sent and ready to process
+- `Encoding` - Actively processing buffer
+- `Exit` - Terminal state
+
+The cycle goes: Idle → HasBuffer → Encoding → Idle, with Exit being the terminal state.
+
+**gterzian**: "- remove prints(except the two re missed frame). - `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
+
+**Copilot**: Final cleanup:
+1. Removed print statements:
+   - Removed `println!("Recording GIF to: {}", gif_path)` from encoder start
+   - Removed `println!("GIF encoder thread exited")` from worker cleanup
+   - Kept diagnostic warnings: `eprintln!("Warning: Missed frame...")` and `eprintln!("Skipping GIF frame - encoder busy")`
+
+2. Made state machine invariants explicit:
+   - Changed encoder's wait loop to explicitly handle `GifEncodeState::Encoding` as `unreachable!()`
+   - This enforces the invariant that encoder should never be in `Encoding` state at loop start
+   - The encoder sets `Encoding` itself and transitions out before returning to wait
+   - Only valid wait states are: `Idle`, `HasBuffer`, and `Exit`
+

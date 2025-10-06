@@ -6,7 +6,11 @@
 // - Board starts with a random row and evolves infinitely
 // - When the board fills up, it scrolls down (shifts up) and continues computing
 
+use clap::Parser;
+use gif::{Encoder as GifEncoder, Frame, Repeat};
 use rand::Rng;
+use std::fs::File;
+use std::io::BufWriter;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use vello::kurbo::RoundedRect;
@@ -28,6 +32,14 @@ const VISIBLE_BOARD_HEIGHT: usize = (WINDOW_HEIGHT as f64 / CELL_SIZE) as usize;
 const BOARD_WIDTH: usize = VISIBLE_BOARD_WIDTH * 3;
 const BOARD_HEIGHT: usize = VISIBLE_BOARD_HEIGHT;
 const STEPS_PER_FRAME: usize = 10; // Rows computed per frame
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Optional path to save the run as a GIF file
+    #[arg(long, value_name = "FILE")]
+    record_gif: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CellState {
@@ -106,6 +118,7 @@ impl Board {
 // Shared State & Synchronization
 // ============================================================================
 
+#[derive(Debug)]
 enum SceneState {
     Presenting,
     NeedUpdate,
@@ -116,14 +129,29 @@ enum SceneState {
 
 struct SharedState {
     work_cv: Arc<(Mutex<SceneState>, Condvar)>,
+    gif_path: Option<String>,
 }
 
 impl SharedState {
-    fn new() -> Self {
+    fn new(gif_path: Option<String>) -> Self {
         SharedState {
             work_cv: Arc::new((Mutex::new(SceneState::Presenting), Condvar::new())),
+            gif_path,
         }
     }
+}
+
+// State for GIF encoding thread
+enum GifEncodeState {
+    Idle,
+    HasBuffer(Arc<wgpu::Buffer>),
+    Encoding,
+    Exit,
+}
+
+struct GifSharedState {
+    cv: Arc<(Mutex<GifEncodeState>, Condvar)>,
+    device: Arc<wgpu::Device>,
 }
 
 // ============================================================================
@@ -187,11 +215,116 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
 // Worker Threads
 // ============================================================================
 
+// GIF encoder thread
+fn gif_encoder_thread(
+    gif_path: String,
+    gif_shared: Arc<GifSharedState>,
+) {
+    let file = File::create(&gif_path).expect("failed to create GIF file");
+    let writer = BufWriter::new(file);
+    let mut encoder = GifEncoder::new(
+        writer,
+        WINDOW_WIDTH as u16,
+        WINDOW_HEIGHT as u16,
+        &[],
+    )
+    .expect("failed to create GIF encoder");
+    encoder.set_repeat(Repeat::Infinite).expect("failed to set repeat");
+
+    loop {
+        let buffer = {
+            let (lock, cvar) = &*gif_shared.cv;
+            let mut state = lock.lock().unwrap();
+            loop {
+                match &*state {
+                    GifEncodeState::HasBuffer(_) => break,
+                    GifEncodeState::Exit => return,
+                    GifEncodeState::Idle => {
+                        state = cvar.wait(state).unwrap();
+                    }
+                    GifEncodeState::Encoding => {
+                        unreachable!("Encoder should not be in Encoding state at loop start")
+                    }
+                }
+            }
+            // Take the buffer and transition to Encoding
+            match std::mem::replace(&mut *state, GifEncodeState::Encoding) {
+                GifEncodeState::HasBuffer(buffer) => buffer,
+                _ => unreachable!(),
+            }
+        };
+
+        // Map the buffer and copy data (this is the blocking part, now in encoder thread)
+        let frame_data = {
+            let buffer_slice = buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            let _ = gif_shared.device.poll(wgpu::PollType::Wait);
+            if rx.recv().unwrap().is_err() {
+                eprintln!("Failed to map GIF capture buffer");
+                // Transition back to Idle
+                let (lock, _cvar) = &*gif_shared.cv;
+                let mut state = lock.lock().unwrap();
+                *state = GifEncodeState::Idle;
+                continue;
+            }
+            let data = buffer_slice.get_mapped_range();
+            let frame_data = data.to_vec();
+            drop(data);
+            buffer.unmap();
+            frame_data
+        };
+
+        // Convert RGBA to indexed color
+        let mut indexed = vec![0u8; (WINDOW_WIDTH * WINDOW_HEIGHT) as usize];
+        let mut palette = vec![0u8; 256 * 3];
+
+        // Create grayscale palette
+        for i in 0..256 {
+            palette[i * 3] = i as u8;
+            palette[i * 3 + 1] = i as u8;
+            palette[i * 3 + 2] = i as u8;
+        }
+
+        // Convert RGBA to grayscale index
+        for i in 0..(WINDOW_WIDTH * WINDOW_HEIGHT) as usize {
+            let r = frame_data[i * 4];
+            let g = frame_data[i * 4 + 1];
+            let b = frame_data[i * 4 + 2];
+            let gray = ((r as u32 + g as u32 + b as u32) / 3) as u8;
+            indexed[i] = gray;
+        }
+
+        let mut frame = Frame::from_indexed_pixels(
+            WINDOW_WIDTH as u16,
+            WINDOW_HEIGHT as u16,
+            indexed,
+            None,
+        );
+        frame.palette = Some(palette);
+        frame.delay = 6;
+
+        if let Err(e) = encoder.write_frame(&frame) {
+            eprintln!("Failed to write GIF frame: {}", e);
+        }
+
+        // Transition back to Idle
+        {
+            let (lock, _cvar) = &*gif_shared.cv;
+            let mut state = lock.lock().unwrap();
+            *state = GifEncodeState::Idle;
+        }
+    }
+}
+
 fn worker(
     shared: Arc<SharedState>,
     proxy: EventLoopProxy<UserEvent>,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    gif_path: Option<String>,
 ) {
     // Worker owns the board - no sharing needed
     let mut board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
@@ -209,6 +342,25 @@ fn worker(
 
     let mut scene = Scene::new();
 
+    // Start GIF encoder thread if recording
+    let (gif_shared, gif_encoder_handle) = if let Some(path) = gif_path.as_ref() {
+        let gif_shared = Arc::new(GifSharedState {
+            cv: Arc::new((Mutex::new(GifEncodeState::Idle), Condvar::new())),
+            device: Arc::clone(&device),
+        });
+        let gif_shared_clone = Arc::clone(&gif_shared);
+        let path_clone = path.clone();
+        let handle = thread::Builder::new()
+            .name("gif_encoder".to_string())
+            .spawn(move || {
+                gif_encoder_thread(path_clone, gif_shared_clone);
+            })
+            .expect("failed to spawn gif encoder thread");
+        (Some(gif_shared), Some(handle))
+    } else {
+        (None, None)
+    };
+
     loop {
         // Wait for NeedUpdate state, or exit if requested
         {
@@ -221,6 +373,18 @@ fn worker(
                         break;
                     }
                     SceneState::Exit => {
+                        // Signal GIF encoder thread to exit and join it
+                        if let Some(gif_shared) = &gif_shared {
+                            let (lock, cvar) = &*gif_shared.cv;
+                            let mut state = lock.lock().unwrap();
+                            *state = GifEncodeState::Exit;
+                            cvar.notify_one();
+                            drop(state);
+                        }
+                        drop(state);
+                        if let Some(handle) = gif_encoder_handle {
+                            let _ = handle.join();
+                        }
                         return; // Exit worker thread
                     }
                     _ => {
@@ -321,6 +485,62 @@ fn worker(
                 },
             )
             .expect("failed to render to texture");
+
+        // Capture frame to GIF if recording (only if encoder is idle)
+        if let Some(ref gif_shared) = gif_shared {
+            // Check if encoder is idle
+            let should_capture = {
+                let (lock, _cvar) = &*gif_shared.cv;
+                let state = lock.lock().unwrap();
+                matches!(*state, GifEncodeState::Idle)
+            };
+
+            if should_capture {
+                // Create buffer to read texture data  
+                let buffer_size = (WINDOW_WIDTH * WINDOW_HEIGHT * 4) as wgpu::BufferAddress;
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("capture_buffer"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+
+                let mut copy_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("capture_encoder"),
+                });
+
+                // Copy texture to buffer using correct wgpu 26.0.1 API
+                copy_encoder.copy_texture_to_buffer(
+                    texture.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(WINDOW_WIDTH * 4),
+                            rows_per_image: None,
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: WINDOW_WIDTH,
+                        height: WINDOW_HEIGHT,
+                        depth_or_array_layers: 1,
+                    },
+                );
+
+                queue.submit(std::iter::once(copy_encoder.finish()));
+
+                // Send buffer to encoder thread (non-blocking, encoder will map it)
+                {
+                    let (lock, cvar) = &*gif_shared.cv;
+                    let mut state = lock.lock().unwrap();
+                    *state = GifEncodeState::HasBuffer(Arc::new(buffer));
+                    cvar.notify_one();
+                }
+            } else {
+                // Encoder is busy, skip this frame
+                eprintln!("Skipping GIF frame - encoder busy");
+            }
+        }
 
         // Put texture back as Updated (main thread will be woken by user event)
         {
@@ -448,10 +668,11 @@ impl ApplicationHandler<UserEvent> for App {
         let worker_proxy = self.proxy.clone();
         let worker_device = Arc::clone(&device);
         let worker_queue = Arc::clone(&queue);
+        let gif_path = self.shared.gif_path.clone();
         let handle = thread::Builder::new()
             .name("worker".to_string())
             .spawn(move || {
-                worker(worker_shared, worker_proxy, worker_device, worker_queue);
+                worker(worker_shared, worker_proxy, worker_device, worker_queue, gif_path);
             })
             .expect("failed to spawn worker thread");
         self.worker_handle = Some(handle);
@@ -502,9 +723,8 @@ impl ApplicationHandler<UserEvent> for App {
                             cvar.notify_one();
                         }
                         _ => {
-                            unreachable!(
-                                "RedrawRequested should only be called when state is Presenting"
-                            );
+                            // Missed a frame - worker is still busy
+                            eprintln!("Warning: Missed frame, worker still in state: {:?}", *state);
                         }
                     }
                 }
@@ -613,7 +833,9 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
-    let shared = Arc::new(SharedState::new());
+    let args = Args::parse();
+
+    let shared = Arc::new(SharedState::new(args.record_gif));
 
     // Create event loop
     let event_loop = EventLoop::<UserEvent>::with_user_event()
