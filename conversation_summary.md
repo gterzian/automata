@@ -1,6 +1,6 @@
 # Rule 110 Cellular Automaton Visualizer - Evolution
 
-## Project Requirements
+## Original Request
 
 > **gterzian**: Goal of the project: 2d visualizer of history of 1d automaton.
 > 
@@ -9,6 +9,10 @@
 > - Use Vello for drawing
 > - Use rayon for thread-pool
 > - Use winit for window management
+> 
+> Notes on compute: update cells from right to left per row, and break-up rows in conceptual columns to be computed in parallel by 4 threads. To enable this, the entire matrix should be shared in a arc + mutex, so should individual rows, and individuals chunks of rows. The idea is that there should be minimal contention on the cells which two workers need to read/write, since by the time a worker compute the left most cell in a column/chunk, the worker computing the neighboring chunk will have moved on further to the left.
+> 
+> Notes on render: try to do as much as possible using vello in the background thread(scene building, but also is possible render to offscreen buffer), and then back on the main thread do what it necessary to update the screen.
 > 
 > Important: follow the TLA spec closely to implement the automata logic.
 
