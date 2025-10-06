@@ -45,7 +45,7 @@ User decided to simplify the initial design:
 - **Parallel computation → Single-threaded**: Removed column-based parallelization with multiple worker threads competing for shared board state. Simplified to single worker thread with exclusive board ownership.
 - **Dependencies pruned**: Removed rayon (no longer needed), later re-added clap for CLI args
 
-### Key Bug Fixes (User-Identified)
+### Key Bug Fixes
 
 **gterzian**: "Don't always just listen to me, there is a bug in the setting of should compute to new paused"
 
@@ -200,7 +200,7 @@ Used Servo's vello_backend.rs as reference for correct API:
 - `wgpu::TexelCopyBufferLayout` (not `ImageDataLayout`)
 - `wgpu::PollType::Poll`/`::Wait` (not `Maintain` enum)
 
-### Thread Cleanup (User-Requested)
+### Thread Cleanup
 
 **gterzian**: "keep the join handle to the encoder, join on it when you exit"
 
@@ -212,7 +212,7 @@ Implemented hierarchical shutdown:
 3. Worker joins encoder thread handle
 4. Clean termination
 
-### Code Quality (User-Requested)
+### Code Quality
 
 **gterzian**: "In the definition of an enum expressing a state machine like `GifEncodeState`, it's good practice for the variant to be, if possible, defined in the order in which they will occur in practice."
 
