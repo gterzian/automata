@@ -38,4 +38,6 @@ cargo run --release -- --record-gif output.gif
 
 ### Example Output
 
+Below is a janky gif of a sample run; it is janky by design, because gif generation is made subordinate to window frame generation.
+
 ![Rule 110 Visualization](output.gif)
