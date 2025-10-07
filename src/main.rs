@@ -352,27 +352,6 @@ fn worker(
     };
 
     loop {
-        // Check for exit request first
-        {
-            let (lock, _cvar) = &*shared.work_cv;
-            let state = lock.lock().unwrap();
-            if matches!(*state, SceneState::Exit) {
-                // Signal GIF encoder thread to exit and join it
-                if let Some(gif_shared) = &gif_shared {
-                    let (lock, cvar) = &*gif_shared.cv;
-                    let mut state = lock.lock().unwrap();
-                    *state = GifEncodeState::Exit;
-                    cvar.notify_one();
-                    drop(state);
-                }
-                drop(state);
-                if let Some(handle) = gif_encoder_handle {
-                    let _ = handle.join();
-                }
-                return; // Exit worker thread
-            }
-        }
-
         // Check if board is complete - if so, scroll it down by shifting up
         if current_step >= board.height {
             // Shift board up by STEPS_PER_FRAME rows (discard top rows, continue evolution at bottom)
