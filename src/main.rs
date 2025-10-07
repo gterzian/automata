@@ -121,8 +121,8 @@ impl Board {
 #[derive(Debug)]
 enum SceneState {
     Presenting,
+    Presented,
     NeedUpdate,
-    Rendering,
     Updated(Arc<wgpu::Texture>),
     Exit,
 }
@@ -135,7 +135,7 @@ struct SharedState {
 impl SharedState {
     fn new(gif_path: Option<String>) -> Self {
         SharedState {
-            work_cv: Arc::new((Mutex::new(SceneState::Presenting), Condvar::new())),
+            work_cv: Arc::new((Mutex::new(SceneState::Presented), Condvar::new())),
             gif_path,
         }
     }
@@ -374,39 +374,7 @@ fn worker(
         // Update current step
         current_step = end_step;
 
-        // Wait for NeedUpdate state before rendering
-        {
-            let (lock, cvar) = &*shared.work_cv;
-            let mut state = lock.lock().unwrap();
-            loop {
-                match *state {
-                    SceneState::NeedUpdate => {
-                        *state = SceneState::Rendering;
-                        break;
-                    }
-                    SceneState::Exit => {
-                        // Signal GIF encoder thread to exit and join it
-                        if let Some(gif_shared) = &gif_shared {
-                            let (lock, cvar) = &*gif_shared.cv;
-                            let mut state = lock.lock().unwrap();
-                            *state = GifEncodeState::Exit;
-                            cvar.notify_one();
-                            drop(state);
-                        }
-                        drop(state);
-                        if let Some(handle) = gif_encoder_handle {
-                            let _ = handle.join();
-                        }
-                        return; // Exit worker thread
-                    }
-                    _ => {
-                        state = cvar.wait(state).unwrap();
-                    }
-                }
-            }
-        };
-
-        // Clear scene from previous frame and rebuild
+        // Clear scene and rebuild eagerly (parallel with main thread presenting)
         scene.reset();
 
         // Calculate offsets: leftmost portion horizontally, from top vertically
@@ -476,10 +444,75 @@ fn worker(
             )
             .expect("failed to render to texture");
 
-        // Capture frame to GIF if recording (only if encoder is idle)
+        // Wait for NeedUpdate state
+        {
+            let (lock, cvar) = &*shared.work_cv;
+            let mut state = lock.lock().unwrap();
+            loop {
+                match *state {
+                    SceneState::NeedUpdate => {
+                        *state = SceneState::Updated(Arc::new(texture.clone()));
+                        break;
+                    }
+                    SceneState::Exit => {
+                        // Signal GIF encoder thread to exit and join it
+                        if let Some(gif_shared) = &gif_shared {
+                            let (lock, cvar) = &*gif_shared.cv;
+                            let mut state = lock.lock().unwrap();
+                            *state = GifEncodeState::Exit;
+                            cvar.notify_one();
+                            drop(state);
+                        }
+                        drop(state);
+                        if let Some(handle) = gif_encoder_handle {
+                            let _ = handle.join();
+                        }
+                        return; // Exit worker thread
+                    }
+                    _ => {
+                        state = cvar.wait(state).unwrap();
+                    }
+                }
+            }
+        }
+        let _ = proxy.send_event(UserEvent::RenderComplete);
+
+        // Capture frame to GIF if recording
         if let Some(ref gif_shared) = gif_shared {
-            // Check if encoder is idle
-            let should_capture = {
+            // Wait for Presented state before doing GIF capture, or break if NeedUpdate (next frame started)
+            let got_presented = {
+                let (lock, cvar) = &*shared.work_cv;
+                let mut state = lock.lock().unwrap();
+                loop {
+                    match *state {
+                        SceneState::Presented => {
+                            break true;
+                        }
+                        SceneState::NeedUpdate => {
+                            break false;
+                        }
+                        SceneState::Exit => {
+                            // Signal GIF encoder thread to exit and join it
+                            let (lock, cvar) = &*gif_shared.cv;
+                            let mut gif_state = lock.lock().unwrap();
+                            *gif_state = GifEncodeState::Exit;
+                            cvar.notify_one();
+                            drop(gif_state);
+                            drop(state);
+                            if let Some(handle) = gif_encoder_handle {
+                                let _ = handle.join();
+                            }
+                            return; // Exit worker thread
+                        }
+                        _ => {
+                            state = cvar.wait(state).unwrap();
+                        }
+                    }
+                }
+            };
+
+            // Check if encoder is idle and we got Presented
+            let should_capture = got_presented && {
                 let (lock, _cvar) = &*gif_shared.cv;
                 let state = lock.lock().unwrap();
                 matches!(*state, GifEncodeState::Idle)
@@ -532,14 +565,6 @@ fn worker(
                 eprintln!("Skipping GIF frame - encoder busy");
             }
         }
-
-        // Put texture back as Updated (main thread will be woken by user event)
-        {
-            let (lock, _cvar) = &*shared.work_cv;
-            let mut state = lock.lock().unwrap();
-            *state = SceneState::Updated(Arc::new(texture));
-        }
-        let _ = proxy.send_event(UserEvent::RenderComplete);
     }
 }
 
@@ -713,9 +738,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if !self.paused {
                     let (lock, cvar) = &*self.shared.work_cv;
                     let mut state = lock.lock().unwrap();
-                    // State should be Presenting when RedrawRequested is called
+                    // State should be Presented when RedrawRequested is called
                     match *state {
-                        SceneState::Presenting => {
+                        SceneState::Presented => {
                             *state = SceneState::NeedUpdate;
                             cvar.notify_one();
                         }
@@ -808,6 +833,14 @@ impl ApplicationHandler<UserEvent> for App {
 
                         queue.submit(std::iter::once(encoder.finish()));
                         surface_texture.present();
+
+                        // Signal worker that presentation is done
+                        {
+                            let (lock, cvar) = &*self.shared.work_cv;
+                            let mut state = lock.lock().unwrap();
+                            *state = SceneState::Presented;
+                            cvar.notify_one();
+                        }
                     }
                 }
 
