@@ -131,6 +131,24 @@ Worker checks encoder state before capturing: only capture if `Idle`, skip frame
 
 Made invariant explicit: encoder sets `Encoding` itself and transitions out before looping back, so it should be `unreachable!()` in the wait loop.
 
+### Episode 4: Parallelism Optimization - Compute Before Wait
+
+After establishing the working three-thread system, user requested restructuring the worker loop to enable more parallelism between computation and presentation.
+
+**gterzian**: "introduce a bit more parallelism between the main thread presents, and the worker computes a step... move the wait on `SceneState::NeedUpdate` to after when a step has been computed... rename `ComputingUpdate` to `Rendering`"
+
+**The problem**: Worker waited for `NeedUpdate` at the top of the loop before computing, meaning it couldn't compute during the main thread's presentation phase.
+
+**The solution**: Restructure worker loop to move computation before the wait point:
+1. Check for `Exit` state (early termination)
+2. Compute next frame (can run while main thread presents previous frame)
+3. Wait for `NeedUpdate` state
+4. Render computed state to texture
+
+**Key insight**: By computing before waiting, the worker can overlap computation with the main thread's presentation phase. The wait only happens before rendering (which requires the previous frame to be consumed). This maximizes parallelism while maintaining correctness.
+
+**State rename**: `ComputingUpdate` → `Rendering` to better reflect that computation is done before the state transition.
+
 ## Vello 0.6 Migration
 
 User requested updating to latest vello (0.6.0) and moving render-to-texture to the worker thread, with main thread using TextureBlitter to blit to surface. This architecture change required updating wgpu and handling API differences.
@@ -173,7 +191,7 @@ User identified that buffer mapping was blocking the worker thread on GPU operat
 
 ### Three-Thread Architecture
 1. **Main thread**: Event loop, texture blitting, presentation
-2. **Worker thread**: Computation, scene building, rendering, frame capture coordination
+2. **Worker thread**: Computation (parallel with presentation), scene building, rendering, frame capture coordination
 3. **GIF encoder thread**: Buffer mapping (blocking operation), RGBA→grayscale conversion, GIF encoding
 
 ### GifEncodeState Machine
@@ -248,7 +266,9 @@ Removed unnecessary print statements (kept diagnostic warnings). Made state mach
 ```
 SPACE pressed → request redraw
 RedrawRequested → set NeedUpdate + notify worker
-Worker computes → renders to texture → Updated(texture) + RenderComplete
+Worker (if computed) waits for NeedUpdate → renders to texture → Updated(texture) + RenderComplete
 RenderComplete → take texture + set Presenting + blit to surface + present
 Loop continues via next RedrawRequested
+
+Parallelism: Worker computes frame N+1 while main thread presents frame N
 ```

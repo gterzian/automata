@@ -122,7 +122,7 @@ impl Board {
 enum SceneState {
     Presenting,
     NeedUpdate,
-    ComputingUpdate,
+    Rendering,
     Updated(Arc<wgpu::Texture>),
     Exit,
 }
@@ -216,20 +216,14 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
 // ============================================================================
 
 // GIF encoder thread
-fn gif_encoder_thread(
-    gif_path: String,
-    gif_shared: Arc<GifSharedState>,
-) {
+fn gif_encoder_thread(gif_path: String, gif_shared: Arc<GifSharedState>) {
     let file = File::create(&gif_path).expect("failed to create GIF file");
     let writer = BufWriter::new(file);
-    let mut encoder = GifEncoder::new(
-        writer,
-        WINDOW_WIDTH as u16,
-        WINDOW_HEIGHT as u16,
-        &[],
-    )
-    .expect("failed to create GIF encoder");
-    encoder.set_repeat(Repeat::Infinite).expect("failed to set repeat");
+    let mut encoder = GifEncoder::new(writer, WINDOW_WIDTH as u16, WINDOW_HEIGHT as u16, &[])
+        .expect("failed to create GIF encoder");
+    encoder
+        .set_repeat(Repeat::Infinite)
+        .expect("failed to set repeat");
 
     loop {
         let buffer = {
@@ -297,12 +291,8 @@ fn gif_encoder_thread(
             indexed[i] = gray;
         }
 
-        let mut frame = Frame::from_indexed_pixels(
-            WINDOW_WIDTH as u16,
-            WINDOW_HEIGHT as u16,
-            indexed,
-            None,
-        );
+        let mut frame =
+            Frame::from_indexed_pixels(WINDOW_WIDTH as u16, WINDOW_HEIGHT as u16, indexed, None);
         frame.palette = Some(palette);
         frame.delay = 6;
 
@@ -362,14 +352,57 @@ fn worker(
     };
 
     loop {
-        // Wait for NeedUpdate state, or exit if requested
+        // Check for exit request first
+        {
+            let (lock, _cvar) = &*shared.work_cv;
+            let state = lock.lock().unwrap();
+            if matches!(*state, SceneState::Exit) {
+                // Signal GIF encoder thread to exit and join it
+                if let Some(gif_shared) = &gif_shared {
+                    let (lock, cvar) = &*gif_shared.cv;
+                    let mut state = lock.lock().unwrap();
+                    *state = GifEncodeState::Exit;
+                    cvar.notify_one();
+                    drop(state);
+                }
+                drop(state);
+                if let Some(handle) = gif_encoder_handle {
+                    let _ = handle.join();
+                }
+                return; // Exit worker thread
+            }
+        }
+
+        // Check if board is complete - if so, scroll it down by shifting up
+        if current_step >= board.height {
+            // Shift board up by STEPS_PER_FRAME rows (discard top rows, continue evolution at bottom)
+            board.shift_up(STEPS_PER_FRAME);
+
+            // Continue computing from where we left off (accounting for the shift)
+            current_step = board.height - STEPS_PER_FRAME;
+            // Fall through to compute the new rows immediately
+        }
+
+        // Compute next STEPS_PER_FRAME steps
+        let end_step = (current_step + STEPS_PER_FRAME).min(board.height);
+
+        for step in current_step..end_step {
+            for cell in 0..board.width {
+                update_cell(&mut board, step, cell);
+            }
+        }
+
+        // Update current step
+        current_step = end_step;
+
+        // Wait for NeedUpdate state before rendering
         {
             let (lock, cvar) = &*shared.work_cv;
             let mut state = lock.lock().unwrap();
             loop {
                 match *state {
                     SceneState::NeedUpdate => {
-                        *state = SceneState::ComputingUpdate;
+                        *state = SceneState::Rendering;
                         break;
                     }
                     SceneState::Exit => {
@@ -393,28 +426,6 @@ fn worker(
                 }
             }
         };
-
-        // Check if board is complete - if so, scroll it down by shifting up
-        if current_step >= board.height {
-            // Shift board up by STEPS_PER_FRAME rows (discard top rows, continue evolution at bottom)
-            board.shift_up(STEPS_PER_FRAME);
-
-            // Continue computing from where we left off (accounting for the shift)
-            current_step = board.height - STEPS_PER_FRAME;
-            // Fall through to compute the new rows immediately
-        }
-
-        // Compute next STEPS_PER_FRAME steps
-        let end_step = (current_step + STEPS_PER_FRAME).min(board.height);
-
-        for step in current_step..end_step {
-            for cell in 0..board.width {
-                update_cell(&mut board, step, cell);
-            }
-        }
-
-        // Update current step
-        current_step = end_step;
 
         // Clear scene from previous frame and rebuild
         scene.reset();
@@ -496,7 +507,7 @@ fn worker(
             };
 
             if should_capture {
-                // Create buffer to read texture data  
+                // Create buffer to read texture data
                 let buffer_size = (WINDOW_WIDTH * WINDOW_HEIGHT * 4) as wgpu::BufferAddress;
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("capture_buffer"),
@@ -505,9 +516,10 @@ fn worker(
                     mapped_at_creation: false,
                 });
 
-                let mut copy_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("capture_encoder"),
-                });
+                let mut copy_encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("capture_encoder"),
+                    });
 
                 // Copy texture to buffer using correct wgpu 26.0.1 API
                 copy_encoder.copy_texture_to_buffer(
@@ -672,7 +684,13 @@ impl ApplicationHandler<UserEvent> for App {
         let handle = thread::Builder::new()
             .name("worker".to_string())
             .spawn(move || {
-                worker(worker_shared, worker_proxy, worker_device, worker_queue, gif_path);
+                worker(
+                    worker_shared,
+                    worker_proxy,
+                    worker_device,
+                    worker_queue,
+                    gif_path,
+                );
             })
             .expect("failed to spawn worker thread");
         self.worker_handle = Some(handle);
