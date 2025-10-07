@@ -196,6 +196,94 @@ After establishing the working three-thread system, user requested restructuring
 
 **State rename**: `ComputingUpdate` → `Rendering` to better reflect that computation is done before the state transition.
 
+### Episode 5: GIF Bottleneck and Critical Path Decoupling
+
+**Performance Investigation**: User was profiling the application and noticed the main thread was spending significant time in `queue.submit`. I initially tried to explain this as VSync behavior, but user pointed out the profiling data showed a dramatic difference:
+- **With GIF recording**: `queue.submit` taking 24% of main thread time
+- **Without GIF recording**: `queue.submit` taking only 0.18% of time
+
+User identified the root cause: GPU contention. Both the main thread (display blit) and worker thread (GIF texture copy) were submitting GPU work simultaneously, causing the main thread to block waiting for the GPU.
+
+**Solution proposed by user**: Make GIF capture conditional on available time - only capture if there's time between presentation and the next redraw request.
+
+**The solution**: Restructure the state machine and worker loop to make GIF capture opportunistic:
+1. Add `Presented` state to signal when presentation is complete
+2. Remove unnecessary `Rendering` state
+3. Make worker wait for `Presented` OR `NeedUpdate` (whichever comes first)
+4. Only capture GIF if `Presented` was seen (meaning there's time before next frame)
+5. Skip GIF frame if `NeedUpdate` arrives first (next frame started, no time left)
+
+This makes GIF capture opportunistic - it only happens if there's enough time between presentation and the next redraw request. If the system is running behind, GIF frames are skipped gracefully, preventing GIF work from blocking the rendering pipeline.
+
+### State Machine Restructure
+
+**Changes**:
+1. **Removed `Rendering` state** - No longer needed with new flow
+2. **Added `Presented` state** - Signals presentation is complete
+3. **Changed initial state** - From `Presenting` to `Presented`
+4. **Made GIF wait conditional** - Only wait for `Presented` when GIF recording enabled
+
+**New state machine** (5 states):
+- `Presented` - Frame has been presented to screen, ready for next frame
+- `NeedUpdate` - Main thread requests new frame computation  
+- `Updated(texture)` - Worker has computed and rendered new frame
+- `Presenting` - Main thread is blitting and presenting
+- `Exit` - Shutdown signal
+
+**Flow without GIF**:
+```
+Worker: Compute → Render → Wait(NeedUpdate) → Updated → [loop]
+Main: Presented → NeedUpdate → Updated → Presenting → Presented
+```
+
+**Flow with GIF**:
+```
+Worker: Compute → Render → Wait(NeedUpdate) → Updated → RenderComplete →
+        Wait(Presented|NeedUpdate) → [if Presented & time available] Capture GIF → [loop]
+Main: Presented → NeedUpdate → Updated → Presenting → Presented
+```
+
+**Key insight**: GIF capture is conditional - it only happens if `Presented` arrives before `NeedUpdate`, meaning there's time available before the next frame. If the system is behind, `NeedUpdate` arrives first and the GIF frame is skipped.
+
+### Critical Race Condition Fix
+
+**The problem**: After implementing the `Presented` state, the application worked without GIF but hung when GIF recording was enabled. I added debug prints to trace the state machine.
+
+The issue: After worker sends `RenderComplete`, it waits for `Presented`. But the main thread cycles through `Updated → Presenting → Presented → NeedUpdate` quickly. By the time the worker checks the state, it has already moved to `NeedUpdate` for the next frame. The worker is stuck waiting for `Presented` on the condvar, but the notification came and went before it started waiting, causing a deadlock.
+
+**User diagnosed the issue**: "the worker does not get notified until after the redraw requests comes in, and so it is stuck on the wait on the condvar"
+
+**User's solution**: Break out of the wait on both `Presented` and `NeedUpdate`, but only capture the GIF frame if we actually saw `Presented`:
+
+```rust
+let got_presented = match wait_for(Presented | NeedUpdate) {
+    Presented => true,
+    NeedUpdate => false,  // Next frame started, skip this capture
+};
+let should_capture = got_presented && encoder_is_idle();
+```
+
+**Key insights from user**:
+1. Worker must not block waiting for a state that may have already passed
+2. Accept both `Presented` and `NeedUpdate`, using a boolean flag to track which arrived first
+3. Only capture GIF if `Presented` came first (meaning time is available before next frame)
+4. If `NeedUpdate` arrives first, skip the GIF frame - the system is behind and needs to prioritize rendering
+5. Combine the "got_presented" flag with the encoder idle check for the final capture decision
+
+**Performance impact**:
+- GIF capture is opportunistic and time-based, not guaranteed
+- When system is keeping up: GIF frames are captured after presentation
+- When system falls behind: GIF frames are skipped to prioritize rendering
+- Main thread never blocks on GIF work
+- Worker can compute frame N+1 during frame N presentation
+- Graceful degradation under load
+
+**State machine updates**:
+- `RedrawRequested` handler expects `Presented` (not `Presenting`)
+- `RenderComplete` transitions `Updated → Presenting → Presented`
+- Worker only waits for `Presented` when GIF recording enabled
+- Initial state is `Presented` (ready for first frame)
+
 ## Vello 0.6 Migration
 
 User requested updating to latest vello (0.6.0) and moving render-to-texture to the worker thread, with main thread using TextureBlitter to blit to surface. This architecture change required updating wgpu and handling API differences.
@@ -294,9 +382,11 @@ Removed unnecessary print statements (kept diagnostic warnings). Made state mach
 - **Render-to-texture**: Worker renders to wgpu texture, main thread blits to surface
 - **Shared device/queue**: Arc-wrapped, shared between threads
 - **Circular buffer**: O(1) board scrolling using row_offset
-- **State machines**: `SceneState` (5 variants), `GifEncodeState` (4 variants)
+- **State machines**: `SceneState` (5 variants: Presented, NeedUpdate, Updated, Presenting, Exit), `GifEncodeState` (4 variants)
 - **Non-blocking**: Worker never blocks on GPU operations
 - **Frame skipping**: Graceful handling when encoder busy
+- **Parallelism**: Worker computes frame N+1 while main thread presents frame N
+- **GIF isolation**: GIF capture is conditional on available time between frames
 - **Board layout**: 10x wider than visible (4000×300), renders leftmost edge (400×300)
 - **Cyclic boundaries**: Wrapping at edges per TLA+ spec
 - **Infinite scrolling**: Shifts by 10 rows when full
@@ -312,10 +402,13 @@ Removed unnecessary print statements (kept diagnostic warnings). Made state mach
 **Event flow**:
 ```
 SPACE pressed → request redraw
-RedrawRequested → set NeedUpdate + notify worker
-Worker (if computed) waits for NeedUpdate → renders to texture → Updated(texture) + RenderComplete
-RenderComplete → take texture + set Presenting + blit to surface + present
+RedrawRequested (state: Presented) → set NeedUpdate + notify worker
+Worker (computed and waiting) receives NeedUpdate → renders to texture → Updated(texture) + RenderComplete
+RenderComplete → take texture + set Presenting + blit to surface + present → set Presented + notify
+[If GIF enabled] Worker waits for Presented|NeedUpdate → captures frame only if Presented arrived first
 Loop continues via next RedrawRequested
 
 Parallelism: Worker computes frame N+1 while main thread presents frame N
+GIF capture: Conditional on time availability - only if Presented arrives before NeedUpdate
+Race handling: Worker accepts NeedUpdate during GIF wait, skips capture if next frame started
 ```
