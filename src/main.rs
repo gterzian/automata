@@ -28,8 +28,8 @@ const WINDOW_WIDTH: u32 = 1600;
 const WINDOW_HEIGHT: u32 = 1200;
 const VISIBLE_BOARD_WIDTH: usize = (WINDOW_WIDTH as f64 / CELL_SIZE) as usize;
 const VISIBLE_BOARD_HEIGHT: usize = (WINDOW_HEIGHT as f64 / CELL_SIZE) as usize;
-// Compute board 3x wider than visible area (but same height)
-const BOARD_WIDTH: usize = VISIBLE_BOARD_WIDTH * 3;
+// Compute board 10x wider than visible area (but same height)
+const BOARD_WIDTH: usize = VISIBLE_BOARD_WIDTH * 10;
 const BOARD_HEIGHT: usize = VISIBLE_BOARD_HEIGHT;
 const STEPS_PER_FRAME: usize = 10; // Rows computed per frame
 
@@ -430,9 +430,9 @@ fn worker(
         // Clear scene from previous frame and rebuild
         scene.reset();
 
-        // Calculate offsets: middle third horizontally, but from top vertically
-        let start_col = VISIBLE_BOARD_WIDTH;
-        let end_col = start_col + VISIBLE_BOARD_WIDTH;
+        // Calculate offsets: leftmost portion horizontally, from top vertically
+        let start_col = 0;
+        let end_col = VISIBLE_BOARD_WIDTH;
         let start_row = 0;
         let end_row = VISIBLE_BOARD_HEIGHT.min(current_step);
 

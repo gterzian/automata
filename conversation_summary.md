@@ -66,6 +66,53 @@ User updated the TLA+ spec to support infinite evolution instead of stopping whe
 
 Implemented circular buffer with `row_offset` for O(1) scrolling. When board fills, shifts by `STEPS_PER_FRAME` (10 rows) to match compute granularity. Initial attempt shifted by 1 row; user corrected to shift by the full compute step size for smoother scrolling.
 
+## UI Evolution: Board Layout and Viewport
+
+The visible board layout has evolved significantly to provide better visualization of the Rule 110 patterns.
+
+### Initial Layout: Full Board Visible
+
+Initially, the board was exactly the size of the window - what you compute is what you see. The entire automaton evolution was visible from left to right.
+
+**Dimensions**:
+- Board: 400×300 cells (matches window: 1600×1200 pixels at 4px per cell)
+- Viewport: Shows entire board (400×300)
+
+### Split-Screen Layout: 3x Wide Board, Middle Third Visible
+
+To give the automaton more space to evolve complex patterns before displaying them, the board was made 3x wider than the window, with only the middle third visible.
+
+**gterzian** (implicit from code evolution): Expanded board to provide "off-screen" evolution space.
+
+**Dimensions**:
+- Board: 1200×300 cells (3x wider than window)
+- Viewport: Middle third (cells 400-799, showing 400 visible cells)
+- Rationale: Patterns evolve in the left third, mature in the middle (visible), and dissipate in the right third
+
+This "split-screen" approach provided context: patterns entering from the left had already evolved for some time, making the visible evolution more interesting.
+
+### Wide Canvas Layout: 10x Wide Board, Leftmost Edge Visible
+
+**gterzian**: "So now I want to make the board ten times as wide, and, retaining the same window size, only render the left most side of it."
+
+Further expanded to give the automaton dramatically more horizontal space, viewing only the leftmost edge where evolution begins.
+
+**Dimensions**:
+- Board: 4000×300 cells (10x wider than window)
+- Viewport: Leftmost portion (cells 0-399, showing 400 visible cells)
+- Rationale: Massive horizontal space for complex pattern formation, with the window showing where evolution originates
+
+This provides maximum space for the automaton to develop intricate patterns across a wide canvas, while focusing the viewport on the "birth" region where the evolution is actively spreading from the initial conditions.
+
+### Evolution Rationale
+
+The progression from 1x → 3x → 10x board width reflects an understanding that Rule 110 is computationally universal and can generate increasingly complex patterns given sufficient space. The viewport placement shifted from "middle third" to "leftmost edge" because:
+
+1. **3x middle-third**: Showed mature, evolved patterns with context on both sides
+2. **10x leftmost**: Shows the evolution's origin, where patterns are actively forming and propagating
+
+The 10x layout is particularly suited for observing how local interactions at the evolutionary "wavefront" create emergent structure across the vast horizontal space.
+
 ## State Machine Evolution
 
 ### Episode 1: Initial Three-State Machine
@@ -250,7 +297,7 @@ Removed unnecessary print statements (kept diagnostic warnings). Made state mach
 - **State machines**: `SceneState` (5 variants), `GifEncodeState` (4 variants)
 - **Non-blocking**: Worker never blocks on GPU operations
 - **Frame skipping**: Graceful handling when encoder busy
-- **Board layout**: 3x wider than visible (1200×300), renders middle third (400×300)
+- **Board layout**: 10x wider than visible (4000×300), renders leftmost edge (400×300)
 - **Cyclic boundaries**: Wrapping at edges per TLA+ spec
 - **Infinite scrolling**: Shifts by 10 rows when full
 - **Clean shutdown**: Exit states propagate, threads join properly
