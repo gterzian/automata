@@ -212,11 +212,11 @@ fn update_cell(board: &mut Board, step: usize, cell: usize) -> bool {
 }
 
 // ============================================================================
-// Worker Threads
+// Renderer Threads
 // ============================================================================
 
 // GIF encoder thread
-fn gif_encoder_thread(gif_path: String, gif_shared: Arc<GifSharedState>) {
+fn gif_encoder(gif_path: String, gif_shared: Arc<GifSharedState>) {
     let file = File::create(&gif_path).expect("failed to create GIF file");
     let writer = BufWriter::new(file);
     let mut encoder = GifEncoder::new(writer, WINDOW_WIDTH as u16, WINDOW_HEIGHT as u16, &[])
@@ -309,18 +309,17 @@ fn gif_encoder_thread(gif_path: String, gif_shared: Arc<GifSharedState>) {
     }
 }
 
-fn worker(
+fn renderer(
     shared: Arc<SharedState>,
     proxy: EventLoopProxy<UserEvent>,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     gif_path: Option<String>,
 ) {
-    // Worker owns the board - no sharing needed
+    // Renderer owns the board - no sharing needed
     let mut board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
     let mut current_step = 1; // Start at step 1
 
-    // Create renderer for worker thread using shared device
     let mut renderer = Renderer::new(
         &*device,
         RendererOptions {
@@ -343,7 +342,7 @@ fn worker(
         let handle = thread::Builder::new()
             .name("gif_encoder".to_string())
             .spawn(move || {
-                gif_encoder_thread(path_clone, gif_shared_clone);
+                gif_encoder(path_clone, gif_shared_clone);
             })
             .expect("failed to spawn gif encoder thread");
         (Some(gif_shared), Some(handle))
@@ -467,7 +466,7 @@ fn worker(
                         if let Some(handle) = gif_encoder_handle {
                             let _ = handle.join();
                         }
-                        return; // Exit worker thread
+                        return; // Exit renderer thread
                     }
                     _ => {
                         state = cvar.wait(state).unwrap();
@@ -502,7 +501,7 @@ fn worker(
                             if let Some(handle) = gif_encoder_handle {
                                 let _ = handle.join();
                             }
-                            return; // Exit worker thread
+                            return; // Exit renderer thread
                         }
                         _ => {
                             state = cvar.wait(state).unwrap();
@@ -590,7 +589,7 @@ struct App {
     surface_config: Option<wgpu::SurfaceConfiguration>,
     blitter: Option<TextureBlitter>,
     paused: bool,
-    worker_handle: Option<thread::JoinHandle<()>>,
+    renderer_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl App {
@@ -605,7 +604,7 @@ impl App {
             surface_config: None,
             blitter: None,
             paused: false, // Start unpaused
-            worker_handle: None,
+            renderer_handle: None,
         }
     }
 }
@@ -679,25 +678,25 @@ impl ApplicationHandler<UserEvent> for App {
         // Create TextureBlitter (takes only device and format)
         let blitter = TextureBlitter::new(&device, surface_format);
 
-        // Start worker thread
-        let worker_shared = Arc::clone(&self.shared);
-        let worker_proxy = self.proxy.clone();
-        let worker_device = Arc::clone(&device);
-        let worker_queue = Arc::clone(&queue);
+        // Start renderer thread
+        let renderer_shared = Arc::clone(&self.shared);
+        let renderer_proxy = self.proxy.clone();
+        let renderer_device = Arc::clone(&device);
+        let renderer_queue = Arc::clone(&queue);
         let gif_path = self.shared.gif_path.clone();
         let handle = thread::Builder::new()
-            .name("worker".to_string())
+            .name("renderer".to_string())
             .spawn(move || {
-                worker(
-                    worker_shared,
-                    worker_proxy,
-                    worker_device,
-                    worker_queue,
+                renderer(
+                    renderer_shared,
+                    renderer_proxy,
+                    renderer_device,
+                    renderer_queue,
                     gif_path,
                 );
             })
-            .expect("failed to spawn worker thread");
-        self.worker_handle = Some(handle);
+            .expect("failed to spawn renderer thread");
+        self.renderer_handle = Some(handle);
 
         self.window = Some(window);
         self.device = Some(device);
@@ -724,7 +723,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                // Signal worker to exit
+                // Signal renderer to exit
                 let (lock, cvar) = &*self.shared.work_cv;
                 let mut state = lock.lock().unwrap();
                 *state = SceneState::Exit;
@@ -734,7 +733,7 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                // Trigger worker to compute next frame if not paused
+                // Trigger renderer to compute next frame if not paused
                 if !self.paused {
                     let (lock, cvar) = &*self.shared.work_cv;
                     let mut state = lock.lock().unwrap();
@@ -745,8 +744,8 @@ impl ApplicationHandler<UserEvent> for App {
                             cvar.notify_one();
                         }
                         _ => {
-                            // Missed a frame - worker is still busy
-                            eprintln!("Warning: Missed frame, worker still in state: {:?}", *state);
+                            // Missed a frame - renderer is still busy
+                            eprintln!("Warning: Missed frame, renderer still in state: {:?}", *state);
                         }
                     }
                 }
@@ -834,7 +833,7 @@ impl ApplicationHandler<UserEvent> for App {
                         queue.submit(std::iter::once(encoder.finish()));
                         surface_texture.present();
 
-                        // Signal worker that presentation is done
+                        // Signal renderer that presentation is done
                         {
                             let (lock, cvar) = &*self.shared.work_cv;
                             let mut state = lock.lock().unwrap();
@@ -855,8 +854,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // Join worker thread on exit
-        if let Some(handle) = self.worker_handle.take() {
+        // Join renderer thread on exit
+        if let Some(handle) = self.renderer_handle.take() {
             let _ = handle.join();
         }
     }
@@ -875,7 +874,7 @@ fn main() {
 
     let proxy = event_loop.create_proxy();
 
-    // Worker thread will be started in resumed()
+    // Renderer thread will be started in resumed()
     let mut app = App::new(shared, proxy);
 
     event_loop

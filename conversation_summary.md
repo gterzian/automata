@@ -42,7 +42,7 @@ This correctly implements all 8 patterns of Rule 110 (binary: 01101110).
 ### Simplifications
 
 User decided to simplify the initial design:
-- **Parallel computation → Single-threaded**: Removed column-based parallelization with multiple worker threads competing for shared board state. Simplified to single worker thread with exclusive board ownership.
+- **Parallel computation → Single-threaded**: Removed column-based parallelization with multiple renderer threads competing for shared board state. Simplified to single renderer thread with exclusive board ownership.
 - **Dependencies pruned**: Removed rayon (no longer needed), later re-added clap for CLI args
 
 ### Key Bug Fixes
@@ -51,13 +51,13 @@ User decided to simplify the initial design:
 
 Fixed condvar notification timing - was notifying unnecessarily when pausing.
 
-**gterzian**: "At the beginning of the compute worker loop, there is a bug based on the logic we added. Make sure you try to prevent these kind of side effects"
+**gterzian**: "At the beginning of the compute renderer loop, there is a bug based on the logic we added. Make sure you try to prevent these kind of side effects"
 
-Fixed critical bug where worker was immediately setting `should_compute = false` after waking up, breaking the processing loop.
+Fixed critical bug where renderer was immediately setting `should_compute = false` after waking up, breaking the processing loop.
 
 **gterzian**: "Add another variant to the state enum: Presenting..."
 
-Added `Presenting` state to fix race condition where worker could consume `NeedUpdate` while main thread was between finishing blit and calling request_redraw.
+Added `Presenting` state to fix race condition where renderer could consume `NeedUpdate` while main thread was between finishing blit and calling request_redraw.
 
 ### Infinite Scrolling
 > **gterzian**: Instead of stopping at `Done`: keep "scrolling down" by popping a compute step from the top of the board, and pushing a compute step to the bottom.
@@ -125,11 +125,11 @@ The 10x layout is particularly suited for observing how local interactions at th
 
 First attempt used `Option<Scene>` but had logic errors, leading to panics.
 
-**gterzian**: "No so the problem is the worker goes back to the beginning of the loop and then takes the scene again, so if the render event is received you can't be sure the scene is some. We need to do more than use an option around the scene, rather we need an enum with three variants: NeedUpdate(scene), ComputingUpdate, Updated(scene)."
+**gterzian**: "No so the problem is the renderer goes back to the beginning of the loop and then takes the scene again, so if the render event is received you can't be sure the scene is some. We need to do more than use an option around the scene, rather we need an enum with three variants: NeedUpdate(scene), ComputingUpdate, Updated(scene)."
 
 Implemented proper three-state machine:
-- `NeedUpdate(scene)` - Scene ready for worker
-- `ComputingUpdate` - Worker computing
+- `NeedUpdate(scene)` - Scene ready for renderer
+- `ComputingUpdate` - Renderer computing
 - `Updated(scene)` - Scene ready to render
 
 **gterzian**: "only start the compute when RedrawRequested comes in, and only if not paused. This means RenderComplete should just keep the lock and use the scene, not set it immediately to NeedUpdate. Also, we want to re-use the same scene (make sure to reset it)."
@@ -140,25 +140,25 @@ Corrected flow: trigger compute from RedrawRequested instead of RenderComplete.
 
 After Vello 0.6 migration with render-to-texture, discovered a subtle race condition that caused occasional panics.
 
-**gterzian**: "You're right that on start-up, if the worker sets the state to computing before redraw requested comes in, it will panic. But that doesn't happen often, I'm seeing a panic after a while only so far.
+**gterzian**: "You're right that on start-up, if the renderer sets the state to computing before redraw requested comes in, it will panic. But that doesn't happen often, I'm seeing a panic after a while only so far.
 
-Ah I know what it is: in `RenderComplete`, main thread holds a lock, and only releases it at the end(actually it drops and re-aquires it). So the worker thread could be at the top of its loop, not waiting on the condvar but waiting on the lock, and then reading `NeedUpdate` and setting is to computing, meaning that at the next redraw event it is not in `NeedUpdate` anymore.
+Ah I know what it is: in `RenderComplete`, main thread holds a lock, and only releases it at the end(actually it drops and re-aquires it). So the renderer thread could be at the top of its loop, not waiting on the condvar but waiting on the lock, and then reading `NeedUpdate` and setting is to computing, meaning that at the next redraw event it is not in `NeedUpdate` anymore.
 
 This is how to address it:
 - Add another variant to the state enum: Presenting, and in `RenderComplete`, take the state out, and replace it with `Presenting`, and drop the lock.
 - Initial state should be also `Presenting`.
 - In `RedrawRequested`, assert it is `Presenting`, and set it to `NeedUpdate`, and then notify on the condvar."
 
-**The problem**: While main thread held lock to blit, then dropped and reacquired it to set NeedUpdate, the worker could grab the lock in between and transition to ComputingUpdate before the next RedrawRequested.
+**The problem**: While main thread held lock to blit, then dropped and reacquired it to set NeedUpdate, the renderer could grab the lock in between and transition to ComputingUpdate before the next RedrawRequested.
 
 **The solution**: Added `Presenting` state as a barrier:
-- `Presenting` - Main thread is blitting/presenting, worker must wait
-- `NeedUpdate` - Ready for worker to start computing
-- `ComputingUpdate` - Worker is computing
+- `Presenting` - Main thread is blitting/presenting, renderer must wait
+- `NeedUpdate` - Ready for renderer to start computing
+- `ComputingUpdate` - Renderer is computing
 - `Updated(texture)` - Texture ready to blit
-- `Exit` - Signal worker to terminate
+- `Exit` - Signal renderer to terminate
 
-**Key insight**: `Presenting` prevents worker from transitioning NeedUpdate while main thread is between finishing a blit and calling request_redraw().
+**Key insight**: `Presenting` prevents renderer from transitioning NeedUpdate while main thread is between finishing a blit and calling request_redraw().
 
 ### Episode 3: GIF Recording - Similar Pattern in GifEncodeState
 
@@ -166,13 +166,13 @@ When implementing GIF recording, encountered similar coordination issues.
 
 **gterzian**: "It's ok for the gif to miss frames, expected event, so add a `Encoding` variant to `GifEncodeState`, and only send a new frame if it is `Idle`."
 
-Applied same state machine pattern to coordinate worker and encoder thread:
+Applied same state machine pattern to coordinate renderer and encoder thread:
 - `Idle` - Encoder ready to receive frame
 - `HasBuffer(Arc<wgpu::Buffer>)` - Buffer ready to process
 - `Encoding` - Processing frame
 - `Exit` - Terminal state
 
-Worker checks encoder state before capturing: only capture if `Idle`, skip frame if `Encoding`.
+Renderer checks encoder state before capturing: only capture if `Idle`, skip frame if `Encoding`.
 
 **gterzian**: "`GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
 
@@ -180,19 +180,19 @@ Made invariant explicit: encoder sets `Encoding` itself and transitions out befo
 
 ### Episode 4: Parallelism Optimization - Compute Before Wait
 
-After establishing the working three-thread system, user requested restructuring the worker loop to enable more parallelism between computation and presentation.
+After establishing the working three-thread system, user requested restructuring the renderer loop to enable more parallelism between computation and presentation.
 
-**gterzian**: "introduce a bit more parallelism between the main thread presents, and the worker computes a step... move the wait on `SceneState::NeedUpdate` to after when a step has been computed... rename `ComputingUpdate` to `Rendering`"
+**gterzian**: "introduce a bit more parallelism between the main thread presents, and the renderer computes a step... move the wait on `SceneState::NeedUpdate` to after when a step has been computed... rename `ComputingUpdate` to `Rendering`"
 
-**The problem**: Worker waited for `NeedUpdate` at the top of the loop before computing, meaning it couldn't compute during the main thread's presentation phase.
+**The problem**: Renderer waited for `NeedUpdate` at the top of the loop before computing, meaning it couldn't compute during the main thread's presentation phase.
 
-**The solution**: Restructure worker loop to move computation before the wait point:
+**The solution**: Restructure renderer loop to move computation before the wait point:
 1. Check for `Exit` state (early termination)
 2. Compute next frame (can run while main thread presents previous frame)
 3. Wait for `NeedUpdate` state
 4. Render computed state to texture
 
-**Key insight**: By computing before waiting, the worker can overlap computation with the main thread's presentation phase. The wait only happens before rendering (which requires the previous frame to be consumed). This maximizes parallelism while maintaining correctness.
+**Key insight**: By computing before waiting, the renderer can overlap computation with the main thread's presentation phase. The wait only happens before rendering (which requires the previous frame to be consumed). This maximizes parallelism while maintaining correctness.
 
 **State rename**: `ComputingUpdate` → `Rendering` to better reflect that computation is done before the state transition.
 
@@ -202,18 +202,18 @@ After establishing the working three-thread system, user requested restructuring
 - **With GIF recording**: `queue.submit` taking 24% of main thread time
 - **Without GIF recording**: `queue.submit` taking only 0.18% of time
 
-User identified the root cause: GPU contention. Both the main thread (display blit) and worker thread (GIF texture copy) were submitting GPU work simultaneously, causing the main thread to block waiting for the GPU.
+User identified the root cause: GPU contention. Both the main thread (display blit) and renderer thread (GIF texture copy) were submitting GPU work simultaneously, causing the main thread to block waiting for the GPU.
 
-**Solution proposed by user**: Make GIF capture conditional on thread scheduling - only capture if the worker thread gets scheduled before the main thread handles the next redraw event.
+**Solution proposed by user**: Make GIF capture conditional on thread scheduling - only capture if the renderer thread gets scheduled before the main thread handles the next redraw event.
 
-**The solution**: Restructure the state machine and worker loop to make GIF capture opportunistic based on thread scheduling:
+**The solution**: Restructure the state machine and renderer loop to make GIF capture opportunistic based on thread scheduling:
 1. Add `Presented` state to signal when presentation is complete
 2. Remove unnecessary `Rendering` state
-3. Make worker wait for `Presented` OR `NeedUpdate` (whichever comes first based on thread scheduling)
-4. Only capture GIF if `Presented` was seen (worker scheduled before main thread's next redraw)
+3. Make renderer wait for `Presented` OR `NeedUpdate` (whichever comes first based on thread scheduling)
+4. Only capture GIF if `Presented` was seen (renderer scheduled before main thread's next redraw)
 5. Skip GIF frame if `NeedUpdate` arrives first (main thread scheduled first for next redraw)
 
-This makes GIF capture dependent on thread scheduling rather than deterministic timing. When GIF capture happens, it runs in parallel with the worker thread computing and scene building. The hope is that by the time the worker needs GPU access for rendering, the GIF capture GPU work is complete. Importantly, GIF work never interferes with the main thread's GPU usage.
+This makes GIF capture dependent on thread scheduling rather than deterministic timing. When GIF capture happens, it runs in parallel with the renderer thread computing and scene building. The hope is that by the time the renderer needs GPU access for rendering, the GIF capture GPU work is complete. Importantly, GIF work never interferes with the main thread's GPU usage.
 
 ### State Machine Restructure
 
@@ -226,32 +226,32 @@ This makes GIF capture dependent on thread scheduling rather than deterministic 
 **New state machine** (5 states):
 - `Presented` - Frame has been presented to screen, ready for next frame
 - `NeedUpdate` - Main thread requests new frame computation  
-- `Updated(texture)` - Worker has computed and rendered new frame
+- `Updated(texture)` - Renderer has computed and rendered new frame
 - `Presenting` - Main thread is blitting and presenting
 - `Exit` - Shutdown signal
 
 **Flow without GIF**:
 ```
-Worker: Compute → Render → Wait(NeedUpdate) → Updated → [loop]
+Renderer: Compute → Render → Wait(NeedUpdate) → Updated → [loop]
 Main: Presented → NeedUpdate → Updated → Presenting → Presented
 ```
 
 **Flow with GIF**:
 ```
-Worker: Compute → Render → Wait(NeedUpdate) → Updated → RenderComplete →
-        Wait(Presented|NeedUpdate) → [if Presented] Capture GIF (parallel with next compute) → [loop]
+Renderer: Compute → Render → Wait(NeedUpdate) → Updated → RenderComplete →
+        Wait(Presented|NeedUpdate) → [if Presented & time available] Capture GIF (parallel with next compute) → [loop]
 Main: Presented → NeedUpdate → Updated → Presenting → Presented
 ```
 
-**Key insight**: GIF capture depends on thread scheduling - it only happens if the worker thread is scheduled to check the state before the main thread processes the next redraw event. When GIF capture occurs, it runs in parallel with the worker computing the next frame.
+**Key insight**: GIF capture depends on thread scheduling - it only happens if the renderer thread is scheduled to check the state before the main thread processes the next redraw event. When GIF capture occurs, it runs in parallel with the renderer computing the next frame.
 
 ### Critical Race Condition Fix
 
 **The problem**: After implementing the `Presented` state, the application worked without GIF but hung when GIF recording was enabled. I added debug prints to trace the state machine.
 
-The issue: After worker sends `RenderComplete`, it waits for `Presented`. But the main thread cycles through `Updated → Presenting → Presented → NeedUpdate` quickly. By the time the worker checks the state, it has already moved to `NeedUpdate` for the next frame. The worker is stuck waiting for `Presented` on the condvar, but the notification came and went before it started waiting, causing a deadlock.
+The issue: After renderer sends `RenderComplete`, it waits for `Presented`. But the main thread cycles through `Updated → Presenting → Presented → NeedUpdate` quickly. By the time the renderer checks the state, it has already moved to `NeedUpdate` for the next frame. The renderer is stuck waiting for `Presented` on the condvar, but the notification came and went before it started waiting, causing a deadlock.
 
-**User diagnosed the issue**: "the worker does not get notified until after the redraw requests comes in, and so it is stuck on the wait on the condvar"
+**User diagnosed the issue**: "the renderer does not get notified until after the redraw requests comes in, and so it is stuck on the wait on the condvar"
 
 **User's solution**: Break out of the wait on both `Presented` and `NeedUpdate`, but only capture the GIF frame if we actually saw `Presented`:
 
@@ -264,27 +264,27 @@ let should_capture = got_presented && encoder_is_idle();
 ```
 
 **Key insights from user**:
-1. Worker must not block waiting for a state that may have already passed
+1. Renderer must not block waiting for a state that may have already passed
 2. Accept both `Presented` and `NeedUpdate`, using a boolean flag to track which arrived first
 3. Only capture GIF if `Presented` came first - determined by thread scheduling, not deterministic timing
-4. If `NeedUpdate` arrives first (main thread scheduled before worker), skip the GIF frame
+4. If `NeedUpdate` arrives first (main thread scheduled before renderer), skip the GIF frame
 5. Combine the "got_presented" flag with the encoder idle check for the final capture decision
-6. When GIF capture happens, it runs in parallel with worker computing the next frame
-7. Hope that GIF GPU work completes before worker needs GPU for rendering
+6. When GIF capture happens, it runs in parallel with renderer computing the next frame
+7. Hope that GIF GPU work completes before renderer needs GPU for rendering
 
 **Performance impact**:
 - GIF capture is opportunistic and depends on thread scheduling
-- Which thread gets scheduled first (worker vs main) determines if GIF is captured
-- When GIF is captured: runs in parallel with worker's compute/scene building phase
-- GIF GPU work ideally completes before worker's render phase needs GPU
+- Which thread gets scheduled first (renderer vs main) determines if GIF is captured
+- When GIF is captured: runs in parallel with renderer's compute/scene building phase
+- GIF GPU work ideally completes before renderer's render phase needs GPU
 - Main thread never blocks on or interferes with GIF work
-- Worker can compute frame N+1 during frame N presentation
+- Renderer can compute frame N+1 during frame N presentation
 - Graceful frame skipping based on scheduling
 
 **State machine updates**:
 - `RedrawRequested` handler expects `Presented` (not `Presenting`)
 - `RenderComplete` transitions `Updated → Presenting → Presented`
-- Worker only waits for `Presented` when GIF recording enabled
+- Renderer only waits for `Presented` when GIF recording enabled
 - Initial state is `Presented` (ready for first frame)
 
 ## Vello 0.6 Migration
@@ -319,17 +319,17 @@ Vendored and audited gif crate v0.13.3:
 
 ### Non-Blocking Architecture Refactoring
 
-User identified that buffer mapping was blocking the worker thread on GPU operations, which was undesirable. Requested moving the blocking operations to a dedicated encoder thread, with state-based frame skipping when the encoder is busy. Multiple iterations to get the architecture right: first moved capture to worker, then created dedicated encoder thread, then moved buffer mapping to encoder thread.
+User identified that buffer mapping was blocking the renderer thread on GPU operations, which was undesirable. Requested moving the blocking operations to a dedicated encoder thread, with state-based frame skipping when the encoder is busy. Multiple iterations to get the architecture right: first moved capture to renderer, then created dedicated encoder thread, then moved buffer mapping to encoder thread.
 
-**Initial**: Frame capture in worker with blocking buffer mapping.
+**Initial**: Frame capture in renderer with blocking buffer mapping.
 
-**Problem**: GPU blocking in worker thread during buffer mapping.
+**Problem**: GPU blocking in renderer thread during buffer mapping.
 
 **Solution**: Three-thread system with dedicated encoder thread.
 
 ### Three-Thread Architecture
 1. **Main thread**: Event loop, texture blitting, presentation
-2. **Worker thread**: Computation (parallel with presentation), scene building, rendering, frame capture coordination
+2. **Renderer thread**: Computation (parallel with presentation), scene building, rendering, frame capture coordination
 3. **GIF encoder thread**: Buffer mapping (blocking operation), RGBA→grayscale conversion, GIF encoding
 
 ### GifEncodeState Machine
@@ -340,9 +340,9 @@ Variants ordered by occurrence:
 - `Exit` - Terminal state
 
 ### Non-Blocking Frame Capture Flow
-1. Worker checks if encoder is `Idle` (skip frame if busy)
-2. Worker creates buffer and submits GPU copy command (non-blocking)
-3. Worker sends `Arc<wgpu::Buffer>` to encoder thread
+1. Renderer checks if encoder is `Idle` (skip frame if busy)
+2. Renderer creates buffer and submits GPU copy command (non-blocking)
+3. Renderer sends `Arc<wgpu::Buffer>` to encoder thread
 4. Encoder maps buffer (blocking, isolated to encoder thread)
 5. Encoder converts RGBA→grayscale and writes GIF frame (6/100s delay)
 6. Encoder transitions back to `Idle`
@@ -360,12 +360,12 @@ Used Servo's vello_backend.rs as reference for correct API:
 
 **gterzian**: "keep the join handle to the encoder, join on it when you exit"
 
-**gterzian**: "Add a `Exit` variant to the surface. When `WindowEvent::CloseRequested`, set the surface state to it, and when the worker encounters that state, it breaks out of it's main loop(exits). In `ApplicationHandler::exiting`, you can then also join on the thread."
+**gterzian**: "Add a `Exit` variant to the surface. When `WindowEvent::CloseRequested`, set the surface state to it, and when the renderer encounters that state, it breaks out of it's main loop(exits). In `ApplicationHandler::exiting`, you can then also join on the thread."
 
 Implemented hierarchical shutdown:
-1. Worker detects `SceneState::Exit`
-2. Worker signals encoder with `GifEncodeState::Exit`
-3. Worker joins encoder thread handle
+1. Renderer detects `SceneState::Exit`
+2. Renderer signals encoder with `GifEncodeState::Exit`
+3. Renderer joins encoder thread handle
 4. Clean termination
 
 ### Code Quality
@@ -381,15 +381,15 @@ Removed unnecessary print statements (kept diagnostic warnings). Made state mach
 ## Architecture Summary
 
 **Current system**:
-- **Three threads**: Main (event loop + blitting), worker (compute + render), encoder (GIF writing)
-- **Render-to-texture**: Worker renders to wgpu texture, main thread blits to surface
+- **Three threads**: Main (event loop + blitting), renderer (compute + render), encoder (GIF writing)
+- **Render-to-texture**: Renderer renders to wgpu texture, main thread blits to surface
 - **Shared device/queue**: Arc-wrapped, shared between threads
 - **Circular buffer**: O(1) board scrolling using row_offset
 - **State machines**: `SceneState` (5 variants: Presented, NeedUpdate, Updated, Presenting, Exit), `GifEncodeState` (4 variants)
-- **Non-blocking**: Worker never blocks on GPU operations
+- **Non-blocking**: Renderer never blocks on GPU operations
 - **Frame skipping**: Graceful handling when encoder busy
-- **Parallelism**: Worker computes frame N+1 while main thread presents frame N
-- **GIF capture**: Opportunistic based on thread scheduling; runs in parallel with worker's compute phase
+- **Parallelism**: Renderer computes frame N+1 while main thread presents frame N
+- **GIF capture**: Opportunistic based on thread scheduling; runs in parallel with renderer's compute phase
 - **Board layout**: 10x wider than visible (4000×300), renders leftmost edge (400×300)
 - **Cyclic boundaries**: Wrapping at edges per TLA+ spec
 - **Infinite scrolling**: Shifts by 10 rows when full
@@ -405,16 +405,16 @@ Removed unnecessary print statements (kept diagnostic warnings). Made state mach
 **Event flow**:
 ```
 SPACE pressed → request redraw
-RedrawRequested (state: Presented) → set NeedUpdate + notify worker
-Worker (computed and waiting) receives NeedUpdate → renders to texture → Updated(texture) + RenderComplete
+RedrawRequested (state: Presented) → set NeedUpdate + notify renderer
+Renderer (computed and waiting) receives NeedUpdate → renders to texture → Updated(texture) + RenderComplete
 RenderComplete → take texture + set Presenting + blit to surface + present → set Presented + notify
-[If GIF enabled] Worker waits for Presented|NeedUpdate (race based on thread scheduling)
-  - If worker scheduled first: sees Presented → captures GIF in parallel with next compute
+[If GIF enabled] Renderer waits for Presented|NeedUpdate (race based on thread scheduling)
+  - If renderer scheduled first: sees Presented → captures GIF in parallel with next compute
   - If main scheduled first: sees NeedUpdate → skips GIF for this frame
 Loop continues via next RedrawRequested
 
-Parallelism: Worker computes frame N+1 while main thread presents frame N
-GIF capture: Opportunistic based on thread scheduling; when it happens, runs parallel to worker compute
-Thread scheduling: Random which thread (worker/main) gets scheduled first determines GIF capture
-GPU coordination: GIF GPU work aims to complete before worker's render phase needs GPU
+Parallelism: Renderer computes frame N+1 while main thread presents frame N
+GIF capture: Opportunistic based on thread scheduling; when it happens, runs parallel to renderer compute
+Thread scheduling: Random which thread (renderer/main) gets scheduled first determines GIF capture
+GPU coordination: GIF GPU work aims to complete before renderer's render phase needs GPU
 ```
