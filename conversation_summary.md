@@ -204,16 +204,16 @@ After establishing the working three-thread system, user requested restructuring
 
 User identified the root cause: GPU contention. Both the main thread (display blit) and worker thread (GIF texture copy) were submitting GPU work simultaneously, causing the main thread to block waiting for the GPU.
 
-**Solution proposed by user**: Make GIF capture conditional on available time - only capture if there's time between presentation and the next redraw request.
+**Solution proposed by user**: Make GIF capture conditional on thread scheduling - only capture if the worker thread gets scheduled before the main thread handles the next redraw event.
 
-**The solution**: Restructure the state machine and worker loop to make GIF capture opportunistic:
+**The solution**: Restructure the state machine and worker loop to make GIF capture opportunistic based on thread scheduling:
 1. Add `Presented` state to signal when presentation is complete
 2. Remove unnecessary `Rendering` state
-3. Make worker wait for `Presented` OR `NeedUpdate` (whichever comes first)
-4. Only capture GIF if `Presented` was seen (meaning there's time before next frame)
-5. Skip GIF frame if `NeedUpdate` arrives first (next frame started, no time left)
+3. Make worker wait for `Presented` OR `NeedUpdate` (whichever comes first based on thread scheduling)
+4. Only capture GIF if `Presented` was seen (worker scheduled before main thread's next redraw)
+5. Skip GIF frame if `NeedUpdate` arrives first (main thread scheduled first for next redraw)
 
-This makes GIF capture opportunistic - it only happens if there's enough time between presentation and the next redraw request. If the system is running behind, GIF frames are skipped gracefully, preventing GIF work from blocking the rendering pipeline.
+This makes GIF capture dependent on thread scheduling rather than deterministic timing. When GIF capture happens, it runs in parallel with the worker thread computing and scene building. The hope is that by the time the worker needs GPU access for rendering, the GIF capture GPU work is complete. Importantly, GIF work never interferes with the main thread's GPU usage.
 
 ### State Machine Restructure
 
@@ -239,11 +239,11 @@ Main: Presented → NeedUpdate → Updated → Presenting → Presented
 **Flow with GIF**:
 ```
 Worker: Compute → Render → Wait(NeedUpdate) → Updated → RenderComplete →
-        Wait(Presented|NeedUpdate) → [if Presented & time available] Capture GIF → [loop]
+        Wait(Presented|NeedUpdate) → [if Presented] Capture GIF (parallel with next compute) → [loop]
 Main: Presented → NeedUpdate → Updated → Presenting → Presented
 ```
 
-**Key insight**: GIF capture is conditional - it only happens if `Presented` arrives before `NeedUpdate`, meaning there's time available before the next frame. If the system is behind, `NeedUpdate` arrives first and the GIF frame is skipped.
+**Key insight**: GIF capture depends on thread scheduling - it only happens if the worker thread is scheduled to check the state before the main thread processes the next redraw event. When GIF capture occurs, it runs in parallel with the worker computing the next frame.
 
 ### Critical Race Condition Fix
 
@@ -266,17 +266,20 @@ let should_capture = got_presented && encoder_is_idle();
 **Key insights from user**:
 1. Worker must not block waiting for a state that may have already passed
 2. Accept both `Presented` and `NeedUpdate`, using a boolean flag to track which arrived first
-3. Only capture GIF if `Presented` came first (meaning time is available before next frame)
-4. If `NeedUpdate` arrives first, skip the GIF frame - the system is behind and needs to prioritize rendering
+3. Only capture GIF if `Presented` came first - determined by thread scheduling, not deterministic timing
+4. If `NeedUpdate` arrives first (main thread scheduled before worker), skip the GIF frame
 5. Combine the "got_presented" flag with the encoder idle check for the final capture decision
+6. When GIF capture happens, it runs in parallel with worker computing the next frame
+7. Hope that GIF GPU work completes before worker needs GPU for rendering
 
 **Performance impact**:
-- GIF capture is opportunistic and time-based, not guaranteed
-- When system is keeping up: GIF frames are captured after presentation
-- When system falls behind: GIF frames are skipped to prioritize rendering
-- Main thread never blocks on GIF work
+- GIF capture is opportunistic and depends on thread scheduling
+- Which thread gets scheduled first (worker vs main) determines if GIF is captured
+- When GIF is captured: runs in parallel with worker's compute/scene building phase
+- GIF GPU work ideally completes before worker's render phase needs GPU
+- Main thread never blocks on or interferes with GIF work
 - Worker can compute frame N+1 during frame N presentation
-- Graceful degradation under load
+- Graceful frame skipping based on scheduling
 
 **State machine updates**:
 - `RedrawRequested` handler expects `Presented` (not `Presenting`)
@@ -386,7 +389,7 @@ Removed unnecessary print statements (kept diagnostic warnings). Made state mach
 - **Non-blocking**: Worker never blocks on GPU operations
 - **Frame skipping**: Graceful handling when encoder busy
 - **Parallelism**: Worker computes frame N+1 while main thread presents frame N
-- **GIF isolation**: GIF capture is conditional on available time between frames
+- **GIF capture**: Opportunistic based on thread scheduling; runs in parallel with worker's compute phase
 - **Board layout**: 10x wider than visible (4000×300), renders leftmost edge (400×300)
 - **Cyclic boundaries**: Wrapping at edges per TLA+ spec
 - **Infinite scrolling**: Shifts by 10 rows when full
@@ -405,10 +408,13 @@ SPACE pressed → request redraw
 RedrawRequested (state: Presented) → set NeedUpdate + notify worker
 Worker (computed and waiting) receives NeedUpdate → renders to texture → Updated(texture) + RenderComplete
 RenderComplete → take texture + set Presenting + blit to surface + present → set Presented + notify
-[If GIF enabled] Worker waits for Presented|NeedUpdate → captures frame only if Presented arrived first
+[If GIF enabled] Worker waits for Presented|NeedUpdate (race based on thread scheduling)
+  - If worker scheduled first: sees Presented → captures GIF in parallel with next compute
+  - If main scheduled first: sees NeedUpdate → skips GIF for this frame
 Loop continues via next RedrawRequested
 
 Parallelism: Worker computes frame N+1 while main thread presents frame N
-GIF capture: Conditional on time availability - only if Presented arrives before NeedUpdate
-Race handling: Worker accepts NeedUpdate during GIF wait, skips capture if next frame started
+GIF capture: Opportunistic based on thread scheduling; when it happens, runs parallel to worker compute
+Thread scheduling: Random which thread (worker/main) gets scheduled first determines GIF capture
+GPU coordination: GIF GPU work aims to complete before worker's render phase needs GPU
 ```
