@@ -510,7 +510,7 @@ fn renderer(
                 }
             };
 
-            // Check if encoder is idle and we got Presented
+            // Check if encoder is idle.
             let should_capture = got_presented && {
                 let (lock, _cvar) = &*gif_shared.cv;
                 let state = lock.lock().unwrap();
