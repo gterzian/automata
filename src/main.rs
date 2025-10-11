@@ -510,14 +510,14 @@ fn renderer(
                 }
             };
 
-            // Check if encoder is idle.
-            let should_capture = got_presented && {
+            // Only capture if we got Presented and encoder is idle
+            let encoder_is_idle = {
                 let (lock, _cvar) = &*gif_shared.cv;
                 let state = lock.lock().unwrap();
                 matches!(*state, GifEncodeState::Idle)
             };
 
-            if should_capture {
+            if got_presented && encoder_is_idle {
                 // Create buffer to read texture data
                 let buffer_size = (WINDOW_WIDTH * WINDOW_HEIGHT * 4) as wgpu::BufferAddress;
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -745,7 +745,10 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         _ => {
                             // Missed a frame - renderer is still busy
-                            eprintln!("Warning: Missed frame, renderer still in state: {:?}", *state);
+                            eprintln!(
+                                "Warning: Missed frame, renderer still in state: {:?}",
+                                *state
+                            );
                         }
                     }
                 }
