@@ -1,11 +1,10 @@
 ------------------------------ MODULE Rule_110 ------------------------------
-EXTENDS FiniteSets, Integers, TLC
+EXTENDS FiniteSets, Integers
 CONSTANT N
 VARIABLES steps
 -----------------------------------------------------------------------------
-\* TLA+ spec for the current implementation of https://mathworld.wolfram.com/Rule110.html,
-\* starting with a row of random cells.
-\* It would be equivalent to Rule_110.tla, if it were not for the random seed.
+\* TLA+ spec for a version of  https://mathworld.wolfram.com/Rule110.html
+\* allowing to make progress updating cells beyond the current step.
 
 Steps == 1..N
 Cells == 1..N
@@ -35,10 +34,10 @@ Inv == \A step \in Steps:
                         /\ steps[step-1][cell] = 0
                      \/ /\ steps[step-1][cell] = 1                                                         
 -----------------------------------------------------------------------------
-\* Starting with a random row at the top.
+\* Starting with a single rightmost black cell.
 Init == /\ steps = [step \in Steps \cup {0} |-> 
             IF step > 0 THEN [cell \in Cells |-> None] 
-            ELSE [cell \in Cells |-> RandomElement({1, 0}) ]]
+            ELSE [cell \in Cells |-> IF cell < N THEN 0 ELSE 1 ]]
 
 \* Note: cells can be updated for any step,
 \* forming parallel columns, 
@@ -68,5 +67,27 @@ Next == \/ \E step \in Steps: \E cell \in Cells: UpdateCell(step, cell)
 -----------------------------------------------------------------------------
 Spec  ==  Init  /\  [][Next]_<<steps>>
 
-THEOREM  Spec  =>  [](Inv /\ TypeOk)
+THEOREM  Spec  =>  [](TypeOk)
+
+
+\* Spec refines PerStepSpec
+CurrentStepBar == LET F[step \in Steps]
+                        == IF step = N THEN step
+                           ELSE IF \A cell \in Cells: steps[step-1][cell] # None
+                                THEN step
+                                ELSE F[step+1]
+                                           
+                  IN  F[1]
+                  
+StepsBar[step \in Steps \cup {0}] == IF step =< CurrentStepBar THEN steps[step]
+                                     ELSE [cell \in Cells |-> None]
+
+Bar == INSTANCE Rule_110_Step
+       WITH current_step <- CurrentStepBar,
+            steps <- StepsBar
+            
+BarSpec == Bar!PerStepSpec
+
+\* Note: checked in TLC by adding BarSpec as a property of Spec.
+THEOREM Spec => BarSpec
 =============================================================================

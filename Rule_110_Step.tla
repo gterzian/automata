@@ -1,11 +1,10 @@
------------------------------- MODULE Rule_110 ------------------------------
-EXTENDS FiniteSets, Integers, TLC
+--------------------------- MODULE Rule_110_Step ---------------------------
+EXTENDS FiniteSets, Integers
 CONSTANT N
-VARIABLES steps
+VARIABLES steps, current_step
 -----------------------------------------------------------------------------
-\* TLA+ spec for the current implementation of https://mathworld.wolfram.com/Rule110.html,
-\* starting with a row of random cells.
-\* It would be equivalent to Rule_110.tla, if it were not for the random seed.
+\* TLA+ spec for the original description of https://mathworld.wolfram.com/Rule110.html
+\* which only allows for cells to be updated in parallel for the current step.
 
 Steps == 1..N
 Cells == 1..N
@@ -14,6 +13,7 @@ None == 2
 State == {None, 1, 0}
 
 TypeOk == /\ steps \in [Steps \cup {0} -> [Cells -> State]]
+          /\ current_step \in Steps
 
 \* Inductive invariant:
 \* For a cell to be in the 1 state, it must either:
@@ -35,15 +35,18 @@ Inv == \A step \in Steps:
                         /\ steps[step-1][cell] = 0
                      \/ /\ steps[step-1][cell] = 1                                                         
 -----------------------------------------------------------------------------
-\* Starting with a random row at the top.
+\* Starting with a single rightmost black cell.
 Init == /\ steps = [step \in Steps \cup {0} |-> 
             IF step > 0 THEN [cell \in Cells |-> None] 
-            ELSE [cell \in Cells |-> RandomElement({1, 0}) ]]
+            ELSE [cell \in Cells |-> IF cell < N THEN 0 ELSE 1 ]]
+        /\ current_step = 1
 
-\* Note: cells can be updated for any step,
-\* forming parallel columns, 
-\* so long as their neighbors and the cell itself
-\* have been updated in all previous steps.
+UpdateStep == /\ \A cell \in Cells: steps[current_step][cell] # None
+              /\ current_step < N
+              /\ current_step' = current_step + 1
+              /\ UNCHANGED<<steps>>
+
+\* Note: cells can be updated only for the current step.
 UpdateCell(step, cell) == LET
                               last_row == steps[step -1]
                               \* Note: simulating an infinite board by cycling rows
@@ -54,19 +57,22 @@ UpdateCell(step, cell) == LET
                                             []  old_state = 0 /\ right_neighbor = 1 -> 1
                                             [] OTHER -> last_row[cell]
                           IN 
+                          /\ step = current_step
                           /\ steps[step][cell] = None
                           /\ left_neighbor # None
                           /\ right_neighbor # None
                           /\ steps' = [steps EXCEPT ![step][cell] = new_state]
+                          /\ UNCHANGED<<current_step>>
                                                  
         
 Done == /\ \A step \in Steps: \A cell \in Cells: steps[step][cell] # None
-        /\ UNCHANGED<<steps>>
+        /\ UNCHANGED<<steps, current_step>>
 
 Next == \/ \E step \in Steps: \E cell \in Cells: UpdateCell(step, cell)
+        \/ UpdateStep
         \/ Done
 -----------------------------------------------------------------------------
-Spec  ==  Init  /\  [][Next]_<<steps>>
+PerStepSpec  ==  Init  /\  [][Next]_<<steps, current_step>>
 
-THEOREM  Spec  =>  [](Inv /\ TypeOk)
+THEOREM  PerStepSpec  =>  [](TypeOk)
 =============================================================================
