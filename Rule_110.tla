@@ -59,6 +59,7 @@ UpdateCell(step, cell) == LET
                           /\ steps' = [steps EXCEPT ![step][cell] = new_state]
                                                  
         
+        
 Done == /\ \A step \in Steps: \A cell \in Cells: steps[step][cell] # None
         /\ UNCHANGED<<steps>>
 
@@ -71,15 +72,14 @@ THEOREM  Spec  =>  [](TypeOk)
 
 
 \* Spec refines PerStepSpec
-CurrentStepBar == LET F[step \in Steps]
-                        == IF step = N THEN step
-                           ELSE IF \A cell \in Cells: steps[step-1][cell] # None
-                                THEN step
-                                ELSE F[step+1]
+CurrentStepBar == LET F[step \in Steps \cup {0}]
+                        == IF \A cell \in Cells: steps[step][cell] # None
+                                THEN IF step + 1 > N THEN N ELSE step + 1
+                                ELSE F[step-1]
                                            
-                  IN  F[1]
+                  IN  F[N]
                   
-StepsBar[step \in Steps \cup {0}] == IF step =< CurrentStepBar THEN steps[step]
+StepsBar[step \in Steps \cup {0}] == IF step < CurrentStepBar THEN steps[step]
                                      ELSE [cell \in Cells |-> None]
 
 Bar == INSTANCE Rule_110_Step

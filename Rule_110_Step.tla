@@ -33,7 +33,17 @@ Inv == \A step \in Steps:
                \/ /\ step > 0 
                   /\ \/ /\ right_neighbor = 1  
                         /\ steps[step-1][cell] = 0
-                     \/ /\ steps[step-1][cell] = 1                                                         
+                     \/ /\ steps[step-1][cell] = 1 
+                     
+NewState[cell \in Cells] == LET
+                              last_row == steps[current_step -1]
+                              old_state == last_row[cell]
+                              left_neighbor == IF cell -1 > 0 THEN last_row[cell-1] ELSE last_row[N]
+                              right_neighbor == IF cell +1 =< N THEN last_row[cell+1] ELSE last_row[1]
+                            IN
+                            CASE old_state = 1 /\ left_neighbor = 1 /\ right_neighbor = 1 -> 0
+                                 []  old_state = 0 /\ right_neighbor = 1 -> 1
+                                 [] OTHER -> last_row[cell]                                                        
 -----------------------------------------------------------------------------
 \* Starting with a single rightmost black cell.
 Init == /\ steps = [step \in Steps \cup {0} |-> 
@@ -41,35 +51,14 @@ Init == /\ steps = [step \in Steps \cup {0} |->
             ELSE [cell \in Cells |-> IF cell < N THEN 0 ELSE 1 ]]
         /\ current_step = 1
 
-UpdateStep == /\ \A cell \in Cells: steps[current_step][cell] # None
-              /\ current_step < N
-              /\ current_step' = current_step + 1
-              /\ UNCHANGED<<steps>>
-
 \* Note: cells can be updated only for the current step.
-UpdateCell(step, cell) == LET
-                              last_row == steps[step -1]
-                              \* Note: simulating an infinite board by cycling rows
-                              left_neighbor == IF cell -1 > 0 THEN last_row[cell-1] ELSE last_row[N]
-                              right_neighbor == IF cell +1 =< N THEN last_row[cell+1] ELSE last_row[1]
-                              old_state == last_row[cell]
-                              new_state == CASE old_state = 1 /\ left_neighbor = 1 /\ right_neighbor = 1 -> 0
-                                            []  old_state = 0 /\ right_neighbor = 1 -> 1
-                                            [] OTHER -> last_row[cell]
-                          IN 
-                          /\ step = current_step
-                          /\ steps[step][cell] = None
-                          /\ left_neighbor # None
-                          /\ right_neighbor # None
-                          /\ steps' = [steps EXCEPT ![step][cell] = new_state]
-                          /\ UNCHANGED<<current_step>>
-                                                 
+Update == /\ steps' = [steps EXCEPT ![current_step] = [cell \in Cells |-> NewState[cell]]]
+          /\ current_step' = current_step + 1 
         
 Done == /\ \A step \in Steps: \A cell \in Cells: steps[step][cell] # None
         /\ UNCHANGED<<steps, current_step>>
 
-Next == \/ \E step \in Steps: \E cell \in Cells: UpdateCell(step, cell)
-        \/ UpdateStep
+Next == \/ \E step \in Steps: \E cell \in Cells: Update
         \/ Done
 -----------------------------------------------------------------------------
 PerStepSpec  ==  Init  /\  [][Next]_<<steps, current_step>>
