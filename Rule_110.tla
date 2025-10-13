@@ -56,9 +56,7 @@ UpdateCell(step, cell) == LET
                           /\ steps[step][cell] = None
                           /\ left_neighbor # None
                           /\ right_neighbor # None
-                          /\ steps' = [steps EXCEPT ![step][cell] = new_state]
-                                                 
-        
+                          /\ steps' = [steps EXCEPT ![step][cell] = new_state]                           
         
 Done == /\ \A step \in Steps: \A cell \in Cells: steps[step][cell] # None
         /\ UNCHANGED<<steps>>
@@ -68,10 +66,8 @@ Next == \/ \E step \in Steps: \E cell \in Cells: UpdateCell(step, cell)
 -----------------------------------------------------------------------------
 Spec  ==  Init  /\  [][Next]_<<steps>>
 
-THEOREM  Spec  =>  [](TypeOk)
+THEOREM  Spec  =>  [](TypeOk /\ Inv)
 
-
-\* Spec refines PerStepSpec
 CurrentStepBar == LET F[step \in Steps \cup {0}]
                         == IF \A cell \in Cells: steps[step][cell] # None
                                 THEN IF step + 1 > N THEN N ELSE step + 1
@@ -88,6 +84,7 @@ Bar == INSTANCE Rule_110_Step
             
 BarSpec == Bar!PerStepSpec
 
+\* Spec refines PerStepSpec
 \* Note: checked in TLC by adding BarSpec as a property of Spec.
 THEOREM Spec => BarSpec
 =============================================================================

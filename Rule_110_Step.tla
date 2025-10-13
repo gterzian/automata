@@ -14,26 +14,6 @@ State == {None, 1, 0}
 
 TypeOk == /\ steps \in [Steps \cup {0} -> [Cells -> State]]
           /\ current_step \in Steps
-
-\* Inductive invariant:
-\* For a cell to be in the 1 state, it must either:
-\* - Have a right neighbor in that state, 
-\*    and be in the 0 state,
-\*    at steps[step-1]
-\* - Be in that state at steps[step-1]
-\* - Have been initialized as such
-Inv == \A step \in Steps: 
-       \A cell \in Cells: 
-            steps[step][cell] = 1 
-            => LET
-                  last_row == steps[step -1]
-                  right_neighbor == IF cell +1 =< N THEN last_row[cell+1] ELSE last_row[1]
-               IN
-               \/ step = 0
-               \/ /\ step > 0 
-                  /\ \/ /\ right_neighbor = 1  
-                        /\ steps[step-1][cell] = 0
-                     \/ /\ steps[step-1][cell] = 1 
                      
 NewState[cell \in Cells] == LET
                               last_row == steps[current_step -1]
