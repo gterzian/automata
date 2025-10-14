@@ -1,5 +1,9 @@
 # Rule 110 Cellular Automaton Visualizer - Development History
 
+## About This Document
+
+This document chronicles the development of a Rule 110 cellular automaton visualizer, written from my perspective as GitHub Copilot—an AI programming assistant working alongside a human developer. It captures our collaborative process: the user's requirements and corrections, my implementations and misunderstandings, and the iterative refinements that shaped the final architecture. The narrative structure (Episodes 1-7) reflects how the codebase evolved through multiple sessions, with each episode documenting a specific problem, the user's guidance, and the resulting solution. This document serves as both a technical record and a learning artifact, showing how complex concurrent systems emerge through careful iteration and debugging.
+
 ## Project Goals
 
 **Original Vision**: 2D visualizer showing the evolution history of a 1D cellular automaton.
@@ -30,6 +34,21 @@ new_state == CASE old_state = 1 /\ left_neighbor = 1 /\ right_neighbor = 1 -> 0
 1. Pattern 111 → 0 (only time a `1` becomes `0`)
 2. Pattern ?01 → 1 (any state with right neighbor `1` becomes `1`)  
 3. All other patterns preserve their state
+
+## Vello 0.6 Migration
+
+User requested updating to vello 0.6.0, moving render-to-texture to renderer thread, with main using `TextureBlitter`.
+
+**Dependency updates**:
+- vello 0.3 → 0.6.0
+- wgpu 22 → 26.0.1
+
+**API changes**:
+- `Color::rgb8()` → `Color::from_rgb8()`
+- `render_to_texture()` takes `&TextureView` instead of `&Texture`
+- Explicit `AaSupport` required
+
+**Architecture**: Renderer renders to texture, main blits to surface. Single device/queue Arc-shared between threads.
 
 ## Architecture Simplifications
 
@@ -79,11 +98,6 @@ Fixed: Was notifying unnecessarily when pausing.
 **User**: "At the beginning of the compute renderer loop, there is a bug based on the logic we added. Make sure you try to prevent these kind of side effects"
 
 Fixed: Renderer was immediately setting `should_compute = false` after waking up, breaking the processing loop.
-
-### Race Condition During Startup
-**User**: "Add another variant to the state enum: Presenting..."
-
-Added `Presenting` state to fix race where renderer could consume `NeedUpdate` while main thread was between finishing blit and calling request_redraw.
 
 ## State Machine Evolution
 
@@ -147,21 +161,6 @@ User wanted more parallelism between presentation and computation.
 
 **State rename**: `ComputingUpdate` → `Rendering` (computation now happens before state transition).
 
-## Vello 0.6 Migration
-
-User requested updating to vello 0.6.0, moving render-to-texture to renderer thread, with main using `TextureBlitter`.
-
-**Dependency updates**:
-- vello 0.3 → 0.6.0
-- wgpu 22 → 26.0.1
-
-**API changes**:
-- `Color::rgb8()` → `Color::from_rgb8()`
-- `render_to_texture()` takes `&TextureView` instead of `&Texture`
-- Explicit `AaSupport` required
-
-**Architecture**: Renderer renders to texture, main blits to surface. Single device/queue Arc-shared between threads.
-
 ## GIF Recording Feature
 
 **User**: "Add a command line option to save the run to a gif file, and implement it using https://docs.rs/gif/latest/gif/"
@@ -222,6 +221,10 @@ Initial implementation used incorrect type names from older wgpu. User provided 
 - `wgpu::TexelCopyBufferInfo` (not `ImageCopyBuffer`)
 - `wgpu::TexelCopyBufferLayout` (not `ImageDataLayout`)
 - `wgpu::PollType::Poll`/`::Wait` (not `Maintain` enum)
+
+### Iterative Refinement (Episodes 4-7)
+
+The GIF recording feature required significant iteration to achieve the desired performance and correctness. The following episodes show how the state machine evolved to handle GIF capture without blocking the main thread or compromising frame rates.
 
 ### Episode 4: GIF Performance Bottleneck
 
@@ -307,7 +310,7 @@ let should_capture = got_presented && encoder_is_idle();
 - Renderer only waits for `Presented` when GIF recording enabled
 - Initial state is `Presented` (ready for first frame)
 
-### Thread Cleanup
+### Episode 6: Thread Cleanup and Shutdown
 
 **User**: "keep the join handle to the encoder, join on it when you exit"
 
@@ -319,7 +322,24 @@ let should_capture = got_presented && encoder_is_idle();
 3. Renderer joins encoder thread handle
 4. Clean termination
 
-### Code Quality
+### Episode 7: Texture Pooling Optimization
+
+**User**: "In the renderer, instead of creating a new texture each time, I think we can use two textures, initially each None, and then create and render to the one that isn't being presented. So renderer owns two `Option<Arc<Texture>>`, called `presenting` and `rendering`, and mem swaps them when the main thread asks for an update. `SceneState::Updated` can then just clone the Arc (not the texture)."
+
+**Problem**: Creating a new `wgpu::Texture` on every frame was wasteful—allocating GPU memory and duplicating texture data unnecessarily.
+
+**Solution**: Texture pooling with double buffering:
+- Renderer owns two `Option<Arc<wgpu::Texture>>`: `presenting` (currently shown) and `rendering` (next frame)
+- Both start as `None` and are lazily created on first use with `get_or_insert_with()`
+- After rendering, the renderer swaps them: `std::mem::swap(&mut presenting, &mut rendering)`
+- `SceneState::Updated` sends `Arc::clone(presenting.as_ref().unwrap())` — cloning the Arc pointer, not the texture data
+- GIF capture uses `presenting.as_ref().unwrap()` to access the just-presented texture (guaranteed `Some` after first frame)
+
+**Code clarity**: Also simplified the GIF capture conditional by removing the intermediate `should_capture` variable and checking `if got_presented && encoder_is_idle` directly.
+
+**Result**: Only two textures created total (instead of one per frame), efficient GPU memory reuse, thread-safe via Arc. Main thread and renderer never access the same texture simultaneously. Tested working in both GIF and non-GIF modes.
+
+## Code Quality
 
 **User**: "remove prints(except the two re missed frame). `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
 
@@ -357,84 +377,7 @@ Removed unnecessary prints (kept diagnostic warnings). Made state machine invari
 
 **Clean shutdown**: Exit states propagate, threads join properly.
 
-**Dependencies**:
-- vello 0.6.0 - 2D rendering
-- wgpu 26.0.1 - GPU API
-- winit - Window management
-- gif 0.13.3 - GIF encoding
-- clap 4.5 - CLI parsing
-
-## Event Flow
-
-```
-SPACE pressed → request redraw
-RedrawRequested (state: Presented) → set NeedUpdate + notify renderer
-Renderer (computed and waiting) receives NeedUpdate → renders to texture → Updated(texture) + RenderComplete
-RenderComplete → take texture + set Presenting + blit to surface + present → set Presented + notify
-[If GIF enabled] Renderer waits for Presented|NeedUpdate (race based on thread scheduling)
-  - If renderer scheduled first: sees Presented → captures GIF in parallel with next compute
-  - If main scheduled first: sees NeedUpdate → skips GIF for this frame
-Loop continues via next RedrawRequested
-
-Parallelism: Renderer computes frame N+1 while main thread presents frame N
-GIF capture: Opportunistic based on thread scheduling; when it happens, runs parallel to renderer compute
-Thread scheduling: Random which thread (renderer/main) gets scheduled first determines GIF capture
-GPU coordination: GIF GPU work aims to complete before renderer's render phase needs GPU
-```
-
-### Thread Cleanup
-
-**User**: "keep the join handle to the encoder, join on it when you exit"
-
-**User**: "Add a `Exit` variant to the surface. When `WindowEvent::CloseRequested`, set the surface state to it, and when the renderer encounters that state, it breaks out of it's main loop(exits). In `ApplicationHandler::exiting`, you can then also join on the thread."
-
-**Hierarchical shutdown**:
-1. Renderer detects `SceneState::Exit`
-2. Renderer signals encoder with `GifEncodeState::Exit`
-3. Renderer joins encoder thread handle
-4. Clean termination
-
-### Texture Swapping
-
-Instead of creating a new texture every frame, the renderer owns two `Option<Arc<wgpu::Texture>>` called `presenting` and `rendering`, both initially `None` and lazily created. After rendering, they are swapped with `std::mem::swap(&mut presenting, &mut rendering)`, and `SceneState::Updated` clones the Arc (not the texture data). This avoids per-frame allocation overhead—only two textures are created total, and they are efficiently reused. GIF capture uses `presenting.as_ref().unwrap()` to access the just-presented texture.
-
-### Code Quality
-
-**User**: "remove prints(except the two re missed frame). `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
-
-Removed unnecessary prints (kept diagnostic warnings). Made state machine invariant explicit: `Encoding` is `unreachable!()` in encoder's wait loop.
-
-## Current Architecture
-
-**Three threads**:
-- **Main**: Event loop, texture blitting, presentation
-- **Renderer**: Computation (parallel with presentation), scene building, rendering, GIF capture coordination
-- **Encoder**: Buffer mapping (blocking), RGBA→grayscale, GIF encoding
-
-**Render-to-texture**: Renderer renders to wgpu texture, main blits to surface with `TextureBlitter`.
-
-**Shared resources**: Single device/queue Arc-shared between threads.
-
-**Data structures**:
-- Circular buffer with `row_offset` for O(1) scrolling
-- Board: 4000×300 cells, viewport: leftmost 400×300
-- Cyclic boundaries (wraps at edges per TLA+ spec)
-
-**State machines**:
-- `SceneState` (5 states): Presented, NeedUpdate, Updated, Presenting, Exit
-- `GifEncodeState` (4 states): Idle, HasBuffer, Encoding, Exit
-
-**Parallelism**: Renderer computes frame N+1 while main presents frame N.
-
-**GIF capture**: Opportunistic based on thread scheduling; when it happens, runs parallel with renderer's compute phase. Which thread gets scheduled first (renderer/main) determines if GIF captured. GIF GPU work aims to complete before renderer's render phase needs GPU.
-
-**Non-blocking**: Renderer never blocks on GPU operations.
-
-**Frame skipping**: Graceful handling when encoder busy or when system falls behind.
-
-**Infinite scrolling**: Shifts by 10 rows when board fills.
-
-**Clean shutdown**: Exit states propagate, threads join properly.
+**Texture pooling**: Two `Option<Arc<wgpu::Texture>>` owned by renderer, swapped with `std::mem::swap()` after rendering. Only two textures created total, avoiding per-frame allocation overhead.
 
 **Dependencies**:
 - vello 0.6.0 - 2D rendering
