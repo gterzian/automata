@@ -331,6 +331,10 @@ fn renderer(
 
     let mut scene = Scene::new();
 
+    // Two textures for double buffering: one being presented, one being rendered to
+    let mut presenting: Option<Arc<wgpu::Texture>> = None;
+    let mut rendering: Option<Arc<wgpu::Texture>> = None;
+
     // Start GIF encoder thread if recording
     let (gif_shared, gif_encoder_handle) = if let Some(path) = gif_path.as_ref() {
         let gif_shared = Arc::new(GifSharedState {
@@ -408,22 +412,25 @@ fn renderer(
         }
 
         // Render scene to texture
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("render_texture"),
-            size: wgpu::Extent3d {
-                width: WINDOW_WIDTH,
-                height: WINDOW_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+        // Get or create the texture that's not being presented
+        let texture = rendering.get_or_insert_with(|| {
+            Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("render_texture"),
+                size: wgpu::Extent3d {
+                    width: WINDOW_WIDTH,
+                    height: WINDOW_HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            }))
         });
 
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -450,7 +457,10 @@ fn renderer(
             loop {
                 match *state {
                     SceneState::NeedUpdate => {
-                        *state = SceneState::Updated(Arc::new(texture.clone()));
+                        // Swap the textures: rendering becomes presenting, presenting becomes rendering
+                        std::mem::swap(&mut presenting, &mut rendering);
+                        // Clone the Arc (not the texture) and send it
+                        *state = SceneState::Updated(presenting.clone().unwrap());
                         break;
                     }
                     SceneState::Exit => {
@@ -518,6 +528,11 @@ fn renderer(
             };
 
             if got_presented && encoder_is_idle {
+                // Get the texture that was just presented
+                let texture_to_capture = presenting
+                    .as_ref()
+                    .expect("presenting texture should exist");
+
                 // Create buffer to read texture data
                 let buffer_size = (WINDOW_WIDTH * WINDOW_HEIGHT * 4) as wgpu::BufferAddress;
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -534,7 +549,7 @@ fn renderer(
 
                 // Copy texture to buffer using correct wgpu 26.0.1 API
                 copy_encoder.copy_texture_to_buffer(
-                    texture.as_image_copy(),
+                    texture_to_capture.as_image_copy(),
                     wgpu::TexelCopyBufferInfo {
                         buffer: &buffer,
                         layout: wgpu::TexelCopyBufferLayout {

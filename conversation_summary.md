@@ -394,6 +394,10 @@ GPU coordination: GIF GPU work aims to complete before renderer's render phase n
 3. Renderer joins encoder thread handle
 4. Clean termination
 
+### Texture Swapping
+
+Instead of creating a new texture every frame, the renderer owns two `Option<Arc<wgpu::Texture>>` called `presenting` and `rendering`, both initially `None` and lazily created. After rendering, they are swapped with `std::mem::swap(&mut presenting, &mut rendering)`, and `SceneState::Updated` clones the Arc (not the texture data). This avoids per-frame allocation overhead—only two textures are created total, and they are efficiently reused. GIF capture uses `presenting.as_ref().unwrap()` to access the just-presented texture.
+
 ### Code Quality
 
 **User**: "remove prints(except the two re missed frame). `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
