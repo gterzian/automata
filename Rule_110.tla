@@ -70,7 +70,7 @@ THEOREM  Spec  =>  [](TypeOk /\ Inv)
 
 CurrentStepBar == LET F[step \in Steps \cup {0}]
                         == IF \A cell \in Cells: steps[step][cell] # None
-                                THEN IF step + 1 > N THEN N ELSE step + 1
+                                THEN step + 1
                                 ELSE F[step-1]
                                            
                   IN  F[N]
@@ -79,8 +79,7 @@ StepsBar[step \in Steps \cup {0}] == IF step < CurrentStepBar THEN steps[step]
                                      ELSE [cell \in Cells |-> None]
 
 Bar == INSTANCE Rule_110_Step
-       WITH current_step <- CurrentStepBar,
-            steps <- StepsBar
+       WITH steps <- StepsBar
             
 BarSpec == Bar!PerStepSpec
 
