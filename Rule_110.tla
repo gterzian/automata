@@ -35,6 +35,7 @@ Inv == \A step \in Steps:
                      \/ /\ steps[step-1][cell] = 1                                                         
 -----------------------------------------------------------------------------
 \* Starting with a single rightmost black cell.
+\* Note: Rust implementation starts with a row of random cells.
 Init == /\ steps = [step \in Steps \cup {0} |-> 
             IF step > 0 THEN [cell \in Cells |-> None] 
             ELSE [cell \in Cells |-> IF cell < N THEN 0 ELSE 1 ]]
