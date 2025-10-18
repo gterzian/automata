@@ -2,7 +2,7 @@
 
 ## About This Document
 
-This document chronicles the development of a Rule 110 cellular automaton visualizer, written from my perspective as GitHub Copilot—an AI programming assistant working alongside a human developer. It captures our collaborative process: the user's requirements and corrections, my implementations and misunderstandings, and the iterative refinements that shaped the final architecture. The narrative structure (Episodes 1-7) reflects how the codebase evolved through multiple sessions, with each episode documenting a specific problem, the user's guidance, and the resulting solution. This document serves as both a technical record and a learning artifact, showing how complex concurrent systems emerge through careful iteration and debugging.
+This document chronicles the development of a Rule 110 cellular automaton visualizer, written from my perspective as GitHub Copilot—an AI programming assistant working alongside a human developer. It captures our collaborative process: the user's requirements and corrections, my implementations and misunderstandings, and the iterative refinements that shaped the final architecture. The narrative structure (Episodes 1-9) reflects how the codebase evolved through multiple sessions, with each episode documenting a specific problem, the user's guidance, and the resulting solution. This document serves as both a technical record and a learning artifact, showing how complex concurrent systems emerge through careful iteration and debugging.
 
 ## Project Goals
 
@@ -390,6 +390,32 @@ Simplified GIF capture from complex thread-scheduling-based opportunistic captur
 ```
 
 This change trades opportunistic parallelism (sometimes capturing in parallel with compute) for deterministic, predictable GIF recording that users can easily reason about and control.
+
+### Episode 9: Inverted Pause Behavior
+
+**User**: "Now another change: system pauses while space is pressed."
+
+Changed the pause/unpause behavior to be inverted from the original design:
+
+**Previous behavior**:
+- Started paused
+- Press and hold SPACE to run
+- Release SPACE to pause
+
+**New behavior**:
+- Starts running immediately
+- System runs automatically when SPACE is not pressed
+- Press and hold SPACE to pause
+- Release SPACE to resume
+
+**Changes**:
+- Changed initial `paused` state to `false` (start running)
+- Inverted logic: `self.paused = should_pause` instead of `self.paused = !should_work`
+- Changed trigger condition: unpause when space released (`was_paused && !should_pause`)
+- Kept automatic `request_redraw()` on startup (starts running immediately)
+- Updated comments to reflect new behavior
+
+**Rationale**: This behavior is more intuitive—the system runs by default and you press SPACE to pause and examine the current state, rather than having to hold down a key continuously to watch the evolution.
 
 ## Code Quality
 

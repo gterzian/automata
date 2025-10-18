@@ -9,8 +9,8 @@ Supporting blog post: [TLA+ in support of AI code generation](https://medium.com
 ### Features
 
 - Interactive visualization with pause/unpause controls
-- Press and hold SPACE to compute and render (10 rows per frame)
-- Release SPACE to pause
+- System runs automatically and pauses while SPACE is held down
+- Release SPACE to resume computation and rendering (10 rows per frame)
 - Board starts with a single black cell at the top-right and evolves via Rule 110
 - Infinite scrolling - board shifts upward when full to continue evolution
 - Uses cyclic boundaries (wrapping at edges)

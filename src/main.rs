@@ -1,9 +1,9 @@
 // Rule 110 Cellular Automaton Visualizer
 //
 // Displays the evolution of a 1D Rule 110 cellular automaton as a 2D history.
-// - Press and hold SPACE to compute and render (10 rows per frame)
-// - Release SPACE to pause
-// - Board starts with a random row and evolves infinitely
+// - System runs automatically and pauses while SPACE is held down
+// - Release SPACE to resume computation and rendering (10 rows per frame)
+// - Board starts with a single black cell and evolves infinitely
 // - When the board fills up, it scrolls down (shifts up) and continues computing
 
 use clap::Parser;
@@ -493,10 +493,10 @@ fn renderer(
         // Capture frame to GIF if recording (every Nth frame)
         if let Some(ref gif_shared) = gif_shared {
             frame_counter += 1;
-            
+
             // Check if we should capture this frame
             let should_capture = frame_counter % shared.gif_frame_skip == 0;
-            
+
             // Check if encoder is idle
             let encoder_is_idle = {
                 let (lock, _cvar) = &*gif_shared.cv;
@@ -595,7 +595,7 @@ impl App {
             surface: None,
             surface_config: None,
             blitter: None,
-            paused: false, // Start unpaused
+            paused: false, // Start running (pause when space pressed)
             renderer_handle: None,
         }
     }
@@ -697,7 +697,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.surface_config = Some(config);
         self.blitter = Some(blitter);
 
-        // Start rendering immediately since we begin unpaused
+        // Start rendering immediately since we begin running
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -754,13 +754,13 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                 ..
             } => {
-                // Space bar: work only while pressed
-                let should_work = state == ElementState::Pressed;
+                // Space bar: pause while pressed
+                let should_pause = state == ElementState::Pressed;
                 let was_paused = self.paused;
-                self.paused = !should_work;
+                self.paused = should_pause;
 
-                if was_paused && should_work {
-                    // Just unpaused: request redraw to start the cycle again
+                if was_paused && !should_pause {
+                    // Just unpaused (space released): request redraw to start the cycle again
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
