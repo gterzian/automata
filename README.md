@@ -40,12 +40,16 @@ cargo run --release -- --record-gif output.gif --gif-frame-skip 1
 
 # Run with GIF recording every 30th frame (faster, smaller file)
 cargo run --release -- --record-gif output.gif --gif-frame-skip 30
+
+# Run with custom scroll speed (20 pixels per arrow key press)
+cargo run --release -- --scroll-step 20
 ```
 
 ### Command-Line Arguments
 
 - `--record-gif <FILE>`: Optional path to save the visualization as a GIF file. When enabled, frames are captured and encoded in a separate thread without blocking the main visualization.
 - `--gif-frame-skip <N>`: Record every Nth frame to GIF (default: 10). Lower values create smoother but larger GIFs; higher values create smaller files but skip more frames.
+- `--scroll-step <N>`: Number of pixels to scroll per arrow key press (default: 10). Higher values scroll faster; lower values provide finer control.
 
 ### Example Output
 

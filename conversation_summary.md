@@ -509,6 +509,49 @@ Changed scrolling speed from 1 pixel per keypress to 10 pixels:
 - Board initialization: first row all `Zero` except `One` at rightmost position
 - Reset restores viewport to rightmost position
 
+### Episode 12: Configurable Scroll Step
+
+**User**: "make scrolling size configurable with a command line argument, defaulting to 10(as now)"
+
+Made the scroll step size configurable via command-line argument, allowing users to customize scrolling speed for their preferences.
+
+**User**: "don't put it in the shared state, just pass it to the renderer on init"
+
+Refactored to pass `scroll_step` directly to the renderer function rather than storing it in `SharedState`. This is cleaner since it's an initialization parameter that doesn't change during execution.
+
+**Implementation**:
+- Added `scroll_step: usize` field to `Args` struct with `--scroll-step` argument (default: 10)
+- Added `scroll_step: usize` field to `App` struct (stores value from args)
+- Updated `App::new()` to accept `scroll_step` parameter
+- Added `scroll_step: usize` parameter to `renderer()` function
+- In `App::resumed()`, pass `self.scroll_step` to renderer thread spawn
+- Changed renderer scrolling logic from hardcoded `10` to use `scroll_step` parameter
+- Updated README with example usage and documentation for `--scroll-step` argument
+
+**Key insights**:
+1. Making hardcoded values configurable improves user experience
+2. Scroll step affects exploration speed - fast for quick navigation, slow for precise positioning
+3. Command-line argument is appropriate for per-session preference
+4. Passing as function parameter is cleaner than SharedState for init-only values
+5. `App` struct is the appropriate place to hold config values before spawning renderer
+
+**Benefits**:
+- Users can customize scrolling speed to their preference
+- Faster scrolling (e.g., 20 pixels) for quick exploration
+- Slower scrolling (e.g., 5 pixels) for precise viewport positioning
+- Maintains default of 10 pixels for existing behavior
+- Consistent with other configurable parameters (`--gif-frame-skip`)
+- Cleaner architecture: SharedState only for runtime coordination, not config
+
+**Changes**:
+- Added `scroll_step: usize` to `Args` with default value of 10
+- Added `scroll_step: usize` to `App` struct
+- Updated `App::new()` to accept and store `scroll_step`
+- Added `scroll_step: usize` parameter to `renderer()` function
+- Pass `scroll_step` from App to renderer on thread spawn
+- Changed scrolling from `saturating_sub(10)` / `+ 10` to use `scroll_step` parameter
+- Updated README with usage example and parameter documentation
+
 ## Code Quality
 
 **User**: "remove prints(except the two re missed frame). `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
@@ -549,7 +592,8 @@ Removed unnecessary prints (kept diagnostic warnings). Made state machine invari
 - Main thread maintains local `need_scroll_left` and `need_scroll_right` flags
 - Arrow keys set respective flags (no immediate redraw request)
 - On next `RedrawRequested`, passes flags to `NeedUpdate` and clears them
-- Renderer adjusts `viewport_offset` by 10 pixels with bounds checking
+- Renderer adjusts `viewport_offset` by configurable `scroll_step` pixels (default 10) with bounds checking
+- Scroll step configurable via `--scroll-step` command-line argument
 - Allows exploration of full 4000-pixel-wide board
 - Same clean pattern as reset: local flags → state machine → renderer action
 
@@ -565,7 +609,7 @@ Removed unnecessary prints (kept diagnostic warnings). Made state machine invari
 
 **Infinite scrolling**: Shifts by 10 rows when board fills vertically.
 
-**Viewport scrolling**: Arrow keys scroll horizontally 10 pixels per keypress to explore the wide board.
+**Viewport scrolling**: Arrow keys scroll horizontally by configurable step size (default 10 pixels) per keypress to explore the wide board. Step size adjustable via `--scroll-step` argument.
 
 **Clean shutdown**: Exit states propagate, threads join properly.
 
@@ -586,7 +630,7 @@ SPACE released → request redraw (if was paused)
 ESCAPE pressed → set need_reset flag
 Arrow keys pressed → set need_scroll_left or need_scroll_right flag
 RedrawRequested (state: Presented) → set NeedUpdate { reset, scroll_left, scroll_right } + clear flags + notify renderer
-Renderer (computed and waiting) receives NeedUpdate → [if reset] recreate board & reset counters & reset viewport → [if scroll] adjust viewport_offset by ±10 pixels → renders to texture → Updated(texture) + RenderComplete
+Renderer (computed and waiting) receives NeedUpdate → [if reset] recreate board & reset counters & reset viewport → [if scroll] adjust viewport_offset by ±scroll_step pixels → renders to texture → Updated(texture) + RenderComplete
 RenderComplete → take texture + set Presenting + blit to surface + present → set Presented + notify
 [If GIF enabled] Increment frame_counter; if frame_counter % gif_frame_skip == 0 and encoder idle → capture GIF
 Loop continues via next RedrawRequested
@@ -595,5 +639,5 @@ Parallelism: Renderer computes frame N+1 while main thread presents frame N
 GIF capture: Deterministic - every Nth frame where N is configurable (default 10)
 GPU coordination: GIF capture happens after rendering, runs in parallel with next frame's computation
 Reset: Local flag on main thread, passed once per frame, applied in renderer before computation
-Viewport scrolling: Local flags on main thread, passed once per frame, applied in renderer after reset check
+Viewport scrolling: Local flags on main thread, passed once per frame, applied in renderer after reset check; scroll distance configurable (default 10 pixels)
 ```

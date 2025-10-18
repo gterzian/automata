@@ -42,6 +42,10 @@ struct Args {
     /// Record every Nth frame to GIF (default: 10)
     #[arg(long, default_value = "10")]
     gif_frame_skip: usize,
+
+    /// Number of pixels to scroll per arrow key press (default: 10)
+    #[arg(long, default_value = "10")]
+    scroll_step: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +126,11 @@ impl Board {
 enum SceneState {
     Presenting,
     Presented,
-    NeedUpdate { reset: bool, scroll_left: bool, scroll_right: bool },
+    NeedUpdate {
+        reset: bool,
+        scroll_left: bool,
+        scroll_right: bool,
+    },
     Updated(Arc<wgpu::Texture>),
     Exit,
 }
@@ -317,6 +325,7 @@ fn renderer(
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     gif_path: Option<String>,
+    scroll_step: usize,
 ) {
     // Renderer owns the board - no sharing needed
     let mut board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
@@ -460,7 +469,11 @@ fn renderer(
             let mut state = lock.lock().unwrap();
             loop {
                 match *state {
-                    SceneState::NeedUpdate { reset, scroll_left, scroll_right } => {
+                    SceneState::NeedUpdate {
+                        reset,
+                        scroll_left,
+                        scroll_right,
+                    } => {
                         // If reset flag is true, reset the board and counters
                         if reset {
                             board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
@@ -468,12 +481,13 @@ fn renderer(
                             frame_counter = 0;
                             viewport_offset = BOARD_WIDTH - VISIBLE_BOARD_WIDTH;
                         }
-                        // Handle scrolling (10 pixels at a time)
+                        // Handle scrolling
                         if scroll_left && viewport_offset > 0 {
-                            viewport_offset = viewport_offset.saturating_sub(10);
+                            viewport_offset = viewport_offset.saturating_sub(scroll_step);
                         }
                         if scroll_right && viewport_offset + VISIBLE_BOARD_WIDTH < board.width {
-                            viewport_offset = (viewport_offset + 10).min(board.width - VISIBLE_BOARD_WIDTH);
+                            viewport_offset = (viewport_offset + scroll_step)
+                                .min(board.width - VISIBLE_BOARD_WIDTH);
                         }
                         // Swap the textures: rendering becomes presenting, presenting becomes rendering
                         std::mem::swap(&mut presenting, &mut rendering);
@@ -588,6 +602,7 @@ enum UserEvent {
 struct App {
     shared: Arc<SharedState>,
     proxy: EventLoopProxy<UserEvent>,
+    scroll_step: usize,
     window: Option<Arc<Window>>,
     device: Option<Arc<wgpu::Device>>,
     queue: Option<Arc<wgpu::Queue>>,
@@ -602,10 +617,11 @@ struct App {
 }
 
 impl App {
-    fn new(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>) -> Self {
+    fn new(shared: Arc<SharedState>, proxy: EventLoopProxy<UserEvent>, scroll_step: usize) -> Self {
         App {
             shared,
             proxy,
+            scroll_step,
             window: None,
             device: None,
             queue: None,
@@ -696,6 +712,7 @@ impl ApplicationHandler<UserEvent> for App {
         let renderer_device = Arc::clone(&device);
         let renderer_queue = Arc::clone(&queue);
         let gif_path = self.shared.gif_path.clone();
+        let scroll_step = self.scroll_step;
         let handle = thread::Builder::new()
             .name("renderer".to_string())
             .spawn(move || {
@@ -705,6 +722,7 @@ impl ApplicationHandler<UserEvent> for App {
                     renderer_device,
                     renderer_queue,
                     gif_path,
+                    scroll_step,
                 );
             })
             .expect("failed to spawn renderer thread");
@@ -759,7 +777,11 @@ impl ApplicationHandler<UserEvent> for App {
                             self.need_reset = false;
                             self.need_scroll_left = false;
                             self.need_scroll_right = false;
-                            *state = SceneState::NeedUpdate { reset, scroll_left, scroll_right };
+                            *state = SceneState::NeedUpdate {
+                                reset,
+                                scroll_left,
+                                scroll_right,
+                            };
                             cvar.notify_one();
                         }
                         _ => {
@@ -933,7 +955,7 @@ fn main() {
     let proxy = event_loop.create_proxy();
 
     // Renderer thread will be started in resumed()
-    let mut app = App::new(shared, proxy);
+    let mut app = App::new(shared, proxy, args.scroll_step);
 
     event_loop
         .run_app(&mut app)
