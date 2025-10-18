@@ -73,10 +73,9 @@ impl Board {
     fn new(width: usize, height: usize) -> Self {
         let mut cells = vec![vec![CellState::None; width]; height];
 
-        // Init: single black cell at top-right of visible area (column VISIBLE_BOARD_WIDTH - 1)
-        // Rest of first row is zeros
+        // Init: first row is all zeros except rightmost position which is One
         for col in 0..width {
-            if col == VISIBLE_BOARD_WIDTH - 1 {
+            if col == width - 1 {
                 cells[0][col] = CellState::One;
             } else {
                 cells[0][col] = CellState::Zero;
@@ -123,7 +122,7 @@ impl Board {
 enum SceneState {
     Presenting,
     Presented,
-    NeedUpdate(bool), // bool = true means reset before rendering
+    NeedUpdate { reset: bool, scroll_left: bool, scroll_right: bool },
     Updated(Arc<wgpu::Texture>),
     Exit,
 }
@@ -323,6 +322,7 @@ fn renderer(
     let mut board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
     let mut current_step = 1; // Start at step 1
     let mut frame_counter = 0; // Counter for GIF frame recording
+    let mut viewport_offset = BOARD_WIDTH - VISIBLE_BOARD_WIDTH; // Start at rightmost position
 
     let mut renderer = Renderer::new(
         &*device,
@@ -384,9 +384,9 @@ fn renderer(
         // Clear scene and rebuild eagerly (parallel with main thread presenting)
         scene.reset();
 
-        // Calculate offsets: leftmost portion horizontally, from top vertically
-        let start_col = 0;
-        let end_col = VISIBLE_BOARD_WIDTH;
+        // Calculate offsets: viewport_offset determines horizontal position
+        let start_col = viewport_offset;
+        let end_col = (viewport_offset + VISIBLE_BOARD_WIDTH).min(board.width);
         let start_row = 0;
         let end_row = VISIBLE_BOARD_HEIGHT.min(current_step);
 
@@ -460,12 +460,20 @@ fn renderer(
             let mut state = lock.lock().unwrap();
             loop {
                 match *state {
-                    SceneState::NeedUpdate(reset) => {
+                    SceneState::NeedUpdate { reset, scroll_left, scroll_right } => {
                         // If reset flag is true, reset the board and counters
                         if reset {
                             board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
                             current_step = 1;
                             frame_counter = 0;
+                            viewport_offset = BOARD_WIDTH - VISIBLE_BOARD_WIDTH;
+                        }
+                        // Handle scrolling (10 pixels at a time)
+                        if scroll_left && viewport_offset > 0 {
+                            viewport_offset = viewport_offset.saturating_sub(10);
+                        }
+                        if scroll_right && viewport_offset + VISIBLE_BOARD_WIDTH < board.width {
+                            viewport_offset = (viewport_offset + 10).min(board.width - VISIBLE_BOARD_WIDTH);
                         }
                         // Swap the textures: rendering becomes presenting, presenting becomes rendering
                         std::mem::swap(&mut presenting, &mut rendering);
@@ -588,6 +596,8 @@ struct App {
     blitter: Option<TextureBlitter>,
     paused: bool,
     need_reset: bool,
+    need_scroll_left: bool,
+    need_scroll_right: bool,
     renderer_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -604,6 +614,8 @@ impl App {
             blitter: None,
             paused: false, // Start running (pause when space pressed)
             need_reset: false,
+            need_scroll_left: false,
+            need_scroll_right: false,
             renderer_handle: None,
         }
     }
@@ -740,10 +752,14 @@ impl ApplicationHandler<UserEvent> for App {
                     // State should be Presented when RedrawRequested is called
                     match *state {
                         SceneState::Presented => {
-                            // Use the local need_reset flag and then clear it
+                            // Use the local flags and then clear them
                             let reset = self.need_reset;
+                            let scroll_left = self.need_scroll_left;
+                            let scroll_right = self.need_scroll_right;
                             self.need_reset = false;
-                            *state = SceneState::NeedUpdate(reset);
+                            self.need_scroll_left = false;
+                            self.need_scroll_right = false;
+                            *state = SceneState::NeedUpdate { reset, scroll_left, scroll_right };
                             cvar.notify_one();
                         }
                         _ => {
@@ -788,6 +804,30 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 // Escape: set reset flag (will be applied on next redraw)
                 self.need_reset = true;
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::ArrowLeft),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                // Arrow Left: scroll viewport left
+                self.need_scroll_left = true;
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::ArrowRight),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                // Arrow Right: scroll viewport right
+                self.need_scroll_right = true;
             }
             WindowEvent::Resized(size) => {
                 if let (Some(surface), Some(device), Some(config)) =

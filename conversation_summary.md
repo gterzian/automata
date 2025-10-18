@@ -460,6 +460,55 @@ Added ability to reset the automaton back to its initial state (single black cel
 - `RedrawRequested` passes `need_reset` flag and clears it
 - Renderer checks flag and resets board/counters if `true`
 
+### Episode 11: Viewport Scrolling
+
+**User**: "Ok so I want the visible board to move to the left and right when the corresponding arrow keys are pressed. And start with a single black cell at the right most part, and also the visible board should be the right most one. Follow the pattern of using data in `NeedUpdate`(use names keys), and pair it with a local flag to propagate at the next render tick."
+
+Added horizontal viewport scrolling to explore the full board width, following the same local-flag pattern as reset.
+
+**Initial condition change**: "actually just start with a single black cell, but at width - 1"
+
+Changed board initialization to place single black cell at absolute rightmost position (`width - 1`), with all other cells in first row set to `Zero` (not `None`) to enable proper computation.
+
+**Implementation**:
+- Changed `SceneState::NeedUpdate(bool)` to `NeedUpdate { reset: bool, scroll_left: bool, scroll_right: bool }` using named fields
+- Added `viewport_offset: usize` in renderer, starts at `BOARD_WIDTH - VISIBLE_BOARD_WIDTH` (rightmost position)
+- Added `need_scroll_left` and `need_scroll_right` local flags in `App` struct
+- Arrow key handlers set respective flags (no immediate redraw)
+- `RedrawRequested` captures all three flags, clears them, passes to `NeedUpdate`
+- Renderer updates `viewport_offset` based on flags with bounds checking
+- Reset also resets viewport to rightmost position
+
+**User**: "make the scrolling faster, like ten times as fast"
+
+Changed scrolling speed from 1 pixel per keypress to 10 pixels:
+- Left: `viewport_offset.saturating_sub(10)` (prevents underflow)
+- Right: `(viewport_offset + 10).min(board.width - VISIBLE_BOARD_WIDTH)` (prevents overflow)
+
+**Key insights**:
+1. Named struct fields in enum variants improve clarity over positional parameters
+2. Viewport is an independent concern from board state - renderer owns both
+3. Starting at rightmost position shows the seed cell immediately
+4. Fast scrolling (10px) gives responsive exploration of the large board
+5. Bounds checking prevents viewport from going out of range
+
+**Benefits**:
+- Explore entire 10x-wide board interactively
+- See how patterns evolve across the full width
+- Rightmost start position shows seed cell in initial view
+- Fast scrolling makes exploration practical
+- Follows same clean pattern as reset: local flags → state machine → renderer action
+
+**Changes**:
+- `SceneState::NeedUpdate { reset: bool, scroll_left: bool, scroll_right: bool }`
+- Added `viewport_offset: usize` to renderer (tracks horizontal scroll position)
+- Added `need_scroll_left` and `need_scroll_right` to `App` struct
+- Left/Right arrow handlers set respective flags
+- `RedrawRequested` passes all three flags and clears them
+- Renderer scrolls viewport 10 pixels per keypress with bounds checking
+- Board initialization: first row all `Zero` except `One` at rightmost position
+- Reset restores viewport to rightmost position
+
 ## Code Quality
 
 **User**: "remove prints(except the two re missed frame). `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
@@ -478,33 +527,45 @@ Removed unnecessary prints (kept diagnostic warnings). Made state machine invari
 **Shared resources**: Single device/queue Arc-shared between threads.
 
 **Data structures**:
-- Circular buffer with `row_offset` for O(1) scrolling
-- Board: 4000×300 cells, viewport: leftmost 400×300
+- Circular buffer with `row_offset` for O(1) vertical scrolling
+- Board: 4000×300 cells (10x wider than viewport)
+- Viewport: 400×300 cells, horizontal position controlled by `viewport_offset`
+- Viewport starts at rightmost position (shows seed cell)
 - Cyclic boundaries (wraps at edges per TLA+ spec)
 
 **State machines**:
-- `SceneState` (5 states): Presented, NeedUpdate(bool), Updated, Presenting, Exit
-  - `NeedUpdate(bool)`: bool parameter indicates if reset is needed before rendering
+- `SceneState` (5 states): Presented, NeedUpdate { reset, scroll_left, scroll_right }, Updated, Presenting, Exit
+  - `NeedUpdate { reset: bool, scroll_left: bool, scroll_right: bool }`: named fields for reset and scrolling
 - `GifEncodeState` (4 states): Idle, HasBuffer, Encoding, Exit
 
 **Reset mechanism**:
 - Main thread maintains local `need_reset` flag
 - ESCAPE key sets `need_reset = true` (no immediate redraw request)
-- On next `RedrawRequested`, passes flag to `NeedUpdate(reset)` and clears it
-- Renderer checks flag; if true, recreates board and resets counters before rendering
+- On next `RedrawRequested`, passes flag to `NeedUpdate` and clears it
+- Renderer checks flag; if true, recreates board, resets counters, resets viewport to rightmost
 - Simple and race-free: reset state lives on main thread, communicated once per frame
+
+**Viewport scrolling**:
+- Main thread maintains local `need_scroll_left` and `need_scroll_right` flags
+- Arrow keys set respective flags (no immediate redraw request)
+- On next `RedrawRequested`, passes flags to `NeedUpdate` and clears them
+- Renderer adjusts `viewport_offset` by 10 pixels with bounds checking
+- Allows exploration of full 4000-pixel-wide board
+- Same clean pattern as reset: local flags → state machine → renderer action
 
 **Parallelism**: Renderer computes frame N+1 while main presents frame N.
 
 **GIF capture**: Deterministic frame-counting approach - captures every Nth frame (configurable via `--gif-frame-skip`, default 10). Still checks encoder idle state to avoid overwhelming it. Simpler and more predictable than previous thread-scheduling-based approach.
 
-**Initial condition**: Single black cell at top-right of visible area (`VISIBLE_BOARD_WIDTH - 1`), rest of first row zeros. Demonstrates complexity emerging from minimal starting state.
+**Initial condition**: Single black cell at absolute rightmost position (`width - 1`), rest of first row initialized to `Zero`. Viewport starts at rightmost area showing the seed cell. Demonstrates complexity emerging from minimal starting state.
 
 **Non-blocking**: Renderer never blocks on GPU operations.
 
 **Frame skipping**: Graceful handling when encoder busy.
 
-**Infinite scrolling**: Shifts by 10 rows when board fills.
+**Infinite scrolling**: Shifts by 10 rows when board fills vertically.
+
+**Viewport scrolling**: Arrow keys scroll horizontally 10 pixels per keypress to explore the wide board.
 
 **Clean shutdown**: Exit states propagate, threads join properly.
 
@@ -523,8 +584,9 @@ Removed unnecessary prints (kept diagnostic warnings). Made state machine invari
 ```
 SPACE released → request redraw (if was paused)
 ESCAPE pressed → set need_reset flag
-RedrawRequested (state: Presented) → set NeedUpdate(need_reset) + clear flag + notify renderer
-Renderer (computed and waiting) receives NeedUpdate(reset) → [if reset] recreate board & reset counters → renders to texture → Updated(texture) + RenderComplete
+Arrow keys pressed → set need_scroll_left or need_scroll_right flag
+RedrawRequested (state: Presented) → set NeedUpdate { reset, scroll_left, scroll_right } + clear flags + notify renderer
+Renderer (computed and waiting) receives NeedUpdate → [if reset] recreate board & reset counters & reset viewport → [if scroll] adjust viewport_offset by ±10 pixels → renders to texture → Updated(texture) + RenderComplete
 RenderComplete → take texture + set Presenting + blit to surface + present → set Presented + notify
 [If GIF enabled] Increment frame_counter; if frame_counter % gif_frame_skip == 0 and encoder idle → capture GIF
 Loop continues via next RedrawRequested
@@ -533,4 +595,5 @@ Parallelism: Renderer computes frame N+1 while main thread presents frame N
 GIF capture: Deterministic - every Nth frame where N is configurable (default 10)
 GPU coordination: GIF capture happens after rendering, runs in parallel with next frame's computation
 Reset: Local flag on main thread, passed once per frame, applied in renderer before computation
+Viewport scrolling: Local flags on main thread, passed once per frame, applied in renderer after reset check
 ```
