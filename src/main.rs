@@ -69,18 +69,16 @@ struct Board {
 impl Board {
     fn new(width: usize, height: usize) -> Self {
         let mut cells = vec![vec![CellState::None; width]; height];
-        let mut rng = rand::thread_rng();
 
-        // Init: starting with random 0s and 1s in the first row (as per spec)
-        cells[0] = (0..width)
-            .map(|_| {
-                if rng.gen::<bool>() {
-                    CellState::One
-                } else {
-                    CellState::Zero
-                }
-            })
-            .collect();
+        // Init: single black cell at top-right of visible area (column VISIBLE_BOARD_WIDTH - 1)
+        // Rest of first row is zeros
+        for col in 0..width {
+            if col == VISIBLE_BOARD_WIDTH - 1 {
+                cells[0][col] = CellState::One;
+            } else {
+                cells[0][col] = CellState::Zero;
+            }
+        }
 
         Board {
             cells,
