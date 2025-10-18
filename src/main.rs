@@ -8,7 +8,6 @@
 
 use clap::Parser;
 use gif::{Encoder as GifEncoder, Frame, Repeat};
-use rand::Rng;
 use std::fs::File;
 use std::io::BufWriter;
 use std::sync::{Arc, Condvar, Mutex};
@@ -39,6 +38,10 @@ struct Args {
     /// Optional path to save the run as a GIF file
     #[arg(long, value_name = "FILE")]
     record_gif: Option<String>,
+
+    /// Record every Nth frame to GIF (default: 10)
+    #[arg(long, default_value = "10")]
+    gif_frame_skip: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,13 +131,15 @@ enum SceneState {
 struct SharedState {
     work_cv: Arc<(Mutex<SceneState>, Condvar)>,
     gif_path: Option<String>,
+    gif_frame_skip: usize,
 }
 
 impl SharedState {
-    fn new(gif_path: Option<String>) -> Self {
+    fn new(gif_path: Option<String>, gif_frame_skip: usize) -> Self {
         SharedState {
             work_cv: Arc::new((Mutex::new(SceneState::Presented), Condvar::new())),
             gif_path,
+            gif_frame_skip,
         }
     }
 }
@@ -317,6 +322,7 @@ fn renderer(
     // Renderer owns the board - no sharing needed
     let mut board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
     let mut current_step = 1; // Start at step 1
+    let mut frame_counter = 0; // Counter for GIF frame recording
 
     let mut renderer = Renderer::new(
         &*device,
@@ -484,49 +490,22 @@ fn renderer(
         }
         let _ = proxy.send_event(UserEvent::RenderComplete);
 
-        // Capture frame to GIF if recording
+        // Capture frame to GIF if recording (every Nth frame)
         if let Some(ref gif_shared) = gif_shared {
-            // Wait for Presented state before doing GIF capture, or break if NeedUpdate (next frame started)
-            let got_presented = {
-                let (lock, cvar) = &*shared.work_cv;
-                let mut state = lock.lock().unwrap();
-                loop {
-                    match *state {
-                        SceneState::Presented => {
-                            break true;
-                        }
-                        SceneState::NeedUpdate => {
-                            break false;
-                        }
-                        SceneState::Exit => {
-                            // Signal GIF encoder thread to exit and join it
-                            let (lock, cvar) = &*gif_shared.cv;
-                            let mut gif_state = lock.lock().unwrap();
-                            *gif_state = GifEncodeState::Exit;
-                            cvar.notify_one();
-                            drop(gif_state);
-                            drop(state);
-                            if let Some(handle) = gif_encoder_handle {
-                                let _ = handle.join();
-                            }
-                            return; // Exit renderer thread
-                        }
-                        _ => {
-                            state = cvar.wait(state).unwrap();
-                        }
-                    }
-                }
-            };
-
-            // Only capture if we got Presented and encoder is idle
+            frame_counter += 1;
+            
+            // Check if we should capture this frame
+            let should_capture = frame_counter % shared.gif_frame_skip == 0;
+            
+            // Check if encoder is idle
             let encoder_is_idle = {
                 let (lock, _cvar) = &*gif_shared.cv;
                 let state = lock.lock().unwrap();
                 matches!(*state, GifEncodeState::Idle)
             };
 
-            if got_presented && encoder_is_idle {
-                // Get the texture that was just presented
+            if should_capture && encoder_is_idle {
+                // Get the texture that was just rendered
                 let texture_to_capture = presenting
                     .as_ref()
                     .expect("presenting texture should exist");
@@ -572,9 +551,9 @@ fn renderer(
                     *state = GifEncodeState::HasBuffer(Arc::new(buffer));
                     cvar.notify_one();
                 }
-            } else {
+            } else if should_capture && !encoder_is_idle {
                 // Encoder is busy, skip this frame
-                eprintln!("Skipping GIF frame - encoder busy");
+                eprintln!("Skipping GIF frame {} - encoder busy", frame_counter);
             }
         }
     }
@@ -880,7 +859,7 @@ impl ApplicationHandler<UserEvent> for App {
 fn main() {
     let args = Args::parse();
 
-    let shared = Arc::new(SharedState::new(args.record_gif));
+    let shared = Arc::new(SharedState::new(args.record_gif, args.gif_frame_skip));
 
     // Create event loop
     let event_loop = EventLoop::<UserEvent>::with_user_event()

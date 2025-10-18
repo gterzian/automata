@@ -339,6 +339,58 @@ let should_capture = got_presented && encoder_is_idle();
 
 **Result**: Only two textures created total (instead of one per frame), efficient GPU memory reuse, thread-safe via Arc. Main thread and renderer never access the same texture simultaneously. Tested working in both GIF and non-GIF modes.
 
+### Episode 8: Simplified Initial Condition & Deterministic GIF Capture
+
+**User**: "try a single black cell top left for the part of the board that is visible (the rest stays the same)"
+
+Changed initialization from random first row to deterministic single-cell start:
+- Single `CellState::One` at top-right of visible area (`VISIBLE_BOARD_WIDTH - 1`)
+- Rest of first row initialized to `CellState::Zero`
+- Removed `rand` dependency (no longer needed)
+
+This provides a cleaner, more reproducible way to observe Rule 110's evolution from minimal initial conditions—demonstrating how complexity emerges from simplicity.
+
+**User**: "change the '// Capture frame to GIF if recording' logic so that instead of doing the `got_presented` stuff, it simply records reliably once every x frames, default 10. Add a command line argument"
+
+Simplified GIF capture from complex thread-scheduling-based opportunistic capture to simple frame-counting approach:
+
+**Problem with previous approach**: GIF capture depended on which thread (renderer vs main) got scheduled first—unpredictable and dependent on OS scheduling. The "wait for Presented OR NeedUpdate" logic was complex and made GIF recording timing non-deterministic.
+
+**New approach**:
+- Added `--gif-frame-skip <N>` command-line argument (default: 10)
+- Renderer maintains `frame_counter` that increments every frame
+- Captures GIF when `frame_counter % gif_frame_skip == 0` AND encoder is idle
+- Removed complex "wait for Presented" logic entirely
+- Still checks encoder idle state to avoid overwhelming it
+
+**Benefits**:
+- **Deterministic**: Always captures every Nth frame (e.g., frames 10, 20, 30...)
+- **Predictable**: GIF timing independent of thread scheduling
+- **Configurable**: Users control trade-off between smoothness and file size
+- **Simpler**: Removed state machine complexity around `Presented` state coordination
+- **Reliable**: No missed frames due to scheduling races
+
+**Changes**:
+- Added `gif_frame_skip: usize` field to `SharedState`
+- Added `--gif-frame-skip` argument to CLI (default: 10)
+- Added `frame_counter: usize` to renderer loop
+- Simplified capture logic: `if frame_counter % gif_frame_skip == 0 && encoder_is_idle`
+- Removed all `got_presented` wait logic
+
+**Usage examples**:
+```bash
+# Record every 10th frame (default, balanced)
+./automata --record-gif output.gif
+
+# Record every frame (smooth but large/slow)
+./automata --record-gif output.gif --gif-frame-skip 1
+
+# Record every 30th frame (small/fast but choppier)
+./automata --record-gif output.gif --gif-frame-skip 30
+```
+
+This change trades opportunistic parallelism (sometimes capturing in parallel with compute) for deterministic, predictable GIF recording that users can easily reason about and control.
+
 ## Code Quality
 
 **User**: "remove prints(except the two re missed frame). `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
@@ -367,11 +419,13 @@ Removed unnecessary prints (kept diagnostic warnings). Made state machine invari
 
 **Parallelism**: Renderer computes frame N+1 while main presents frame N.
 
-**GIF capture**: Opportunistic based on thread scheduling; when it happens, runs parallel with renderer's compute phase. Which thread gets scheduled first (renderer/main) determines if GIF captured. GIF GPU work aims to complete before renderer's render phase needs GPU.
+**GIF capture**: Deterministic frame-counting approach - captures every Nth frame (configurable via `--gif-frame-skip`, default 10). Still checks encoder idle state to avoid overwhelming it. Simpler and more predictable than previous thread-scheduling-based approach.
+
+**Initial condition**: Single black cell at top-right of visible area (`VISIBLE_BOARD_WIDTH - 1`), rest of first row zeros. Demonstrates complexity emerging from minimal starting state.
 
 **Non-blocking**: Renderer never blocks on GPU operations.
 
-**Frame skipping**: Graceful handling when encoder busy or when system falls behind.
+**Frame skipping**: Graceful handling when encoder busy.
 
 **Infinite scrolling**: Shifts by 10 rows when board fills.
 
@@ -380,11 +434,12 @@ Removed unnecessary prints (kept diagnostic warnings). Made state machine invari
 **Texture pooling**: Two `Option<Arc<wgpu::Texture>>` owned by renderer, swapped with `std::mem::swap()` after rendering. Only two textures created total, avoiding per-frame allocation overhead.
 
 **Dependencies**:
+- winit 0.30 - Window management
 - vello 0.6.0 - 2D rendering
 - wgpu 26.0.1 - GPU API
-- winit - Window management
-- gif 0.13.3 - GIF encoding
-- clap 4.5 - CLI parsing
+- pollster 0.3 - Block on async operations
+- clap 4.5 - CLI parsing (with derive feature)
+- gif 0.13 - GIF encoding
 
 ## Event Flow
 
@@ -393,13 +448,10 @@ SPACE pressed → request redraw
 RedrawRequested (state: Presented) → set NeedUpdate + notify renderer
 Renderer (computed and waiting) receives NeedUpdate → renders to texture → Updated(texture) + RenderComplete
 RenderComplete → take texture + set Presenting + blit to surface + present → set Presented + notify
-[If GIF enabled] Renderer waits for Presented|NeedUpdate (race based on thread scheduling)
-  - If renderer scheduled first: sees Presented → captures GIF in parallel with next compute
-  - If main scheduled first: sees NeedUpdate → skips GIF for this frame
+[If GIF enabled] Increment frame_counter; if frame_counter % gif_frame_skip == 0 and encoder idle → capture GIF
 Loop continues via next RedrawRequested
 
 Parallelism: Renderer computes frame N+1 while main thread presents frame N
-GIF capture: Opportunistic based on thread scheduling; when it happens, runs parallel to renderer compute
-Thread scheduling: Random which thread (renderer/main) gets scheduled first determines GIF capture
-GPU coordination: GIF GPU work aims to complete before renderer's render phase needs GPU
+GIF capture: Deterministic - every Nth frame where N is configurable (default 10)
+GPU coordination: GIF capture happens after rendering, runs in parallel with next frame's computation
 ```
