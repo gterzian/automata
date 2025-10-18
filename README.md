@@ -8,9 +8,10 @@ Supporting blog post: [TLA+ in support of AI code generation](https://medium.com
 
 ### Features
 
-- Interactive visualization with pause/unpause controls
+- Interactive visualization with pause/unpause and reset controls
 - System runs automatically and pauses while SPACE is held down
 - Release SPACE to resume computation and rendering (10 rows per frame)
+- Press ESCAPE to reset the automaton to its initial state
 - Board starts with a single black cell at the top-right and evolves via Rule 110
 - Infinite scrolling - board shifts upward when full to continue evolution
 - Uses cyclic boundaries (wrapping at edges)

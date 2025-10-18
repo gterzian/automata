@@ -417,6 +417,49 @@ Changed the pause/unpause behavior to be inverted from the original design:
 
 **Rationale**: This behavior is more intuitive—the system runs by default and you press SPACE to pause and examine the current state, rather than having to hold down a key continuously to watch the evolution.
 
+### Episode 10: Reset Functionality
+
+**User**: "Now also reset the system when escape is pressed"
+
+Added ability to reset the automaton back to its initial state (single black cell) by pressing ESCAPE.
+
+**Implementation challenges**: Initial attempt added a separate `SceneState::Reset` variant, but this caused complex state machine coordination issues and multiple panics due to texture lifecycle management. User reverted those changes.
+
+**User's clean solution**: "Here is how to do reset cleanly: `NeedUpdate(bool)`, when true, simply reset the board and start from the initial state again"
+
+**User's additional guidance**:
+- "so handle the flag at the subsequent iteration to keep things simple" - Reset happens in renderer's next iteration, not immediately
+- "No, need update should be also a local flag on the main thread, and you set it on the scene at the next redraw request" - Store flag locally on main thread, pass to state machine only during `RedrawRequested`
+- "no need to request a redraw as part of escape, just rely on the ongoing redraw loop" - Don't explicitly trigger redraw; flag will be picked up naturally
+
+**Implementation**:
+- `NeedUpdate(bool)` where `true` means reset before rendering
+- Main thread stores local `need_reset: bool` flag in `App` struct
+- ESCAPE key handler simply sets `need_reset = true` (no state machine interaction, no explicit redraw)
+- On next `RedrawRequested`, pass flag to `NeedUpdate(reset)` and immediately clear it to `false`
+- Renderer checks flag at beginning of next iteration; if true, recreates board, resets `current_step` and `frame_counter`
+- Reset happens before computation/rendering, at natural point in renderer loop
+
+**Key insights**:
+1. Simple parameter addition cleaner than new state variant
+2. Local flag on main thread avoids race conditions
+3. Flag communicated once per frame through existing state machine
+4. Reset happens at natural point in renderer loop (beginning of iteration)
+5. No immediate redraw needed - flag picked up by ongoing loop
+
+**Benefits**:
+- Race-free: reset state lives on main thread
+- Simple: one boolean parameter, one local flag
+- Clean: reuses existing state machine structure
+- Reliable: reset applied at safe point in renderer lifecycle
+
+**Changes**:
+- Added `need_reset: bool` field to `App` struct (initialized to `false`)
+- Changed `SceneState::NeedUpdate` to `NeedUpdate(bool)`
+- ESCAPE handler sets `self.need_reset = true`
+- `RedrawRequested` passes `need_reset` flag and clears it
+- Renderer checks flag and resets board/counters if `true`
+
 ## Code Quality
 
 **User**: "remove prints(except the two re missed frame). `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
@@ -440,8 +483,16 @@ Removed unnecessary prints (kept diagnostic warnings). Made state machine invari
 - Cyclic boundaries (wraps at edges per TLA+ spec)
 
 **State machines**:
-- `SceneState` (5 states): Presented, NeedUpdate, Updated, Presenting, Exit
+- `SceneState` (5 states): Presented, NeedUpdate(bool), Updated, Presenting, Exit
+  - `NeedUpdate(bool)`: bool parameter indicates if reset is needed before rendering
 - `GifEncodeState` (4 states): Idle, HasBuffer, Encoding, Exit
+
+**Reset mechanism**:
+- Main thread maintains local `need_reset` flag
+- ESCAPE key sets `need_reset = true` (no immediate redraw request)
+- On next `RedrawRequested`, passes flag to `NeedUpdate(reset)` and clears it
+- Renderer checks flag; if true, recreates board and resets counters before rendering
+- Simple and race-free: reset state lives on main thread, communicated once per frame
 
 **Parallelism**: Renderer computes frame N+1 while main presents frame N.
 
@@ -470,9 +521,10 @@ Removed unnecessary prints (kept diagnostic warnings). Made state machine invari
 ## Event Flow
 
 ```
-SPACE pressed → request redraw
-RedrawRequested (state: Presented) → set NeedUpdate + notify renderer
-Renderer (computed and waiting) receives NeedUpdate → renders to texture → Updated(texture) + RenderComplete
+SPACE released → request redraw (if was paused)
+ESCAPE pressed → set need_reset flag
+RedrawRequested (state: Presented) → set NeedUpdate(need_reset) + clear flag + notify renderer
+Renderer (computed and waiting) receives NeedUpdate(reset) → [if reset] recreate board & reset counters → renders to texture → Updated(texture) + RenderComplete
 RenderComplete → take texture + set Presenting + blit to surface + present → set Presented + notify
 [If GIF enabled] Increment frame_counter; if frame_counter % gif_frame_skip == 0 and encoder idle → capture GIF
 Loop continues via next RedrawRequested
@@ -480,4 +532,5 @@ Loop continues via next RedrawRequested
 Parallelism: Renderer computes frame N+1 while main thread presents frame N
 GIF capture: Deterministic - every Nth frame where N is configurable (default 10)
 GPU coordination: GIF capture happens after rendering, runs in parallel with next frame's computation
+Reset: Local flag on main thread, passed once per frame, applied in renderer before computation
 ```

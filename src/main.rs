@@ -123,7 +123,7 @@ impl Board {
 enum SceneState {
     Presenting,
     Presented,
-    NeedUpdate,
+    NeedUpdate(bool), // bool = true means reset before rendering
     Updated(Arc<wgpu::Texture>),
     Exit,
 }
@@ -460,7 +460,13 @@ fn renderer(
             let mut state = lock.lock().unwrap();
             loop {
                 match *state {
-                    SceneState::NeedUpdate => {
+                    SceneState::NeedUpdate(reset) => {
+                        // If reset flag is true, reset the board and counters
+                        if reset {
+                            board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
+                            current_step = 1;
+                            frame_counter = 0;
+                        }
                         // Swap the textures: rendering becomes presenting, presenting becomes rendering
                         std::mem::swap(&mut presenting, &mut rendering);
                         // Clone the Arc (not the texture) and send it
@@ -581,6 +587,7 @@ struct App {
     surface_config: Option<wgpu::SurfaceConfiguration>,
     blitter: Option<TextureBlitter>,
     paused: bool,
+    need_reset: bool,
     renderer_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -596,6 +603,7 @@ impl App {
             surface_config: None,
             blitter: None,
             paused: false, // Start running (pause when space pressed)
+            need_reset: false,
             renderer_handle: None,
         }
     }
@@ -732,7 +740,10 @@ impl ApplicationHandler<UserEvent> for App {
                     // State should be Presented when RedrawRequested is called
                     match *state {
                         SceneState::Presented => {
-                            *state = SceneState::NeedUpdate;
+                            // Use the local need_reset flag and then clear it
+                            let reset = self.need_reset;
+                            self.need_reset = false;
+                            *state = SceneState::NeedUpdate(reset);
                             cvar.notify_one();
                         }
                         _ => {
@@ -765,6 +776,18 @@ impl ApplicationHandler<UserEvent> for App {
                         window.request_redraw();
                     }
                 }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Escape),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                // Escape: set reset flag (will be applied on next redraw)
+                self.need_reset = true;
             }
             WindowEvent::Resized(size) => {
                 if let (Some(surface), Some(device), Some(config)) =
