@@ -1,5 +1,11 @@
 # Rule 110 Cellular Automaton Visualizer
 
+```
+###  ##.  #.#  #..  .##  .#.  ..#  ...
+ .    #    #    .    #    #    #    .
+ 0    1    1    0    1    1    1    0
+```
+
 ## Quick Reference
 
 **What it is:** GPU-accelerated visualizer for Rule 110 cellular automaton (computationally universal) following a TLA+ specification.
