@@ -1,8 +1,377 @@
-# Rule 110 Cellular Automaton Visualizer - Development History
+# Rule 110 Cellular Automaton Visualizer
+
+## Quick Reference
+
+**What it is:** GPU-accelerated visualizer for Rule 110 cellular automaton (computationally universal) following a TLA+ specification.
+
+**Current state:** 3-thread architecture (main/renderer/encoder), 4000×300 board with scrollable 400×300 viewport, GIF recording, pause/reset controls.
+
+**Key files:** `src/main.rs` (all code), `Rule_110.tla` & `Rule_110_Step.tla` (TLA+ specs), `Cargo.toml` (deps: winit, vello, wgpu, clap, gif).
+
+**Run:** `cargo run --release` | **Record:** `cargo run --release -- --record-gif out.gif --gif-frame-skip 10` | **Controls:** SPACE=pause, ESCAPE=reset, arrows=scroll
+
+---
 
 ## About This Document
 
-This document chronicles the development of a Rule 110 cellular automaton visualizer, written from my perspective as GitHub Copilot—an AI programming assistant working alongside a human developer. It captures our collaborative process: the user's requirements and corrections, my implementations and misunderstandings, and the iterative refinements that shaped the final architecture. The narrative structure (Episodes 1-9) reflects how the codebase evolved through multiple sessions, with each episode documenting a specific problem, the user's guidance, and the resulting solution. This document serves as both a technical record and a learning artifact, showing how complex concurrent systems emerge through careful iteration and debugging.
+This document chronicles the development of a Rule 110 cellular automaton visualizer, written from my perspective as GitHub Copilot—an AI programming assistant working alongside a human developer. It captures our collaborative process: the user's requirements and corrections, my implementations and misunderstandings, and the iterative refinements that shaped the final architecture.
+
+The document is organized in two main parts:
+1. **Current Architecture** (Sections 1-3): Reference documentation for the system as it exists today
+2. **Development History** (Episodes 1-12): Chronological narrative of how we arrived at this design
+
+This serves as both a technical reference and a learning artifact, showing how complex concurrent systems emerge through careful iteration and debugging.
+
+## Table of Contents
+
+**Part I: Current State**
+- [Project Overview](#project-overview)
+- [Architecture](#current-architecture)
+- [Event Flow](#event-flow)
+- [Usage](#usage)
+
+**Part II: Development History**
+- [Initial Requirements](#project-goals)
+- [Understanding Rule 110](#understanding-rule-110)
+- [Major Design Decisions](#major-design-decisions)
+- [Episodes 1-12: Detailed Evolution](#detailed-development-episodes)
+- [Key Learnings](#key-learnings)
+
+---
+
+# Part I: Current State
+
+## Project Overview
+
+A GPU-accelerated visualizer for Rule 110 cellular automaton, demonstrating how computational universality emerges from simple rules. The implementation strictly follows a TLA+ specification for correctness.
+
+**Key Features:**
+- 4000×300 cell board (10x wider than viewport) with 400×300 visible area
+- Infinite vertical scrolling via circular buffer
+- Horizontal viewport scrolling to explore the full board width
+- Real-time GPU rendering via Vello 0.6
+- Optional GIF recording with configurable frame capture
+- Pause/resume and reset functionality
+- Three-thread architecture for optimal parallelism
+
+**Initial Condition:** Single black cell at rightmost position, demonstrating complexity emerging from minimal initial state.
+
+**Rule 110 Specification:** Follows TLA+ spec precisely - cells change state when pattern 111→0 or ?01→1, otherwise preserve state.
+
+
+## Current Architecture
+
+### System Components
+
+**Three-Thread Architecture:**
+
+1. **Main Thread (Event Loop)**
+   - Window management via winit
+   - Event handling (keyboard input, redraw requests)
+   - Texture blitting to surface via `TextureBlitter`
+   - Frame presentation
+   - Maintains local flags: `need_reset`, `need_scroll_left`, `need_scroll_right`
+
+2. **Renderer Thread**
+   - Board computation (Rule 110 evolution)
+   - Scene building with Vello
+   - GPU rendering to texture
+   - Texture pooling (double buffering)
+   - GIF capture coordination
+   - Viewport management (`viewport_offset`)
+
+3. **GIF Encoder Thread** (optional, when recording)
+   - Buffer mapping (blocking GPU operations)
+   - RGBA→grayscale conversion
+   - GIF frame encoding
+   - Frame skipping when busy
+
+**Shared Resources:**
+- Single `wgpu::Device` and `wgpu::Queue` shared via `Arc` between main and renderer
+- Two state machines for thread coordination (see below)
+- Shared configuration via `SharedState`
+
+### State Machines
+
+**SceneState (Main ↔ Renderer coordination):**
+
+```
+┌─────────────┐  RedrawRequested   ┌──────────────────────────┐
+│  Presented  │──────────────────→ │ NeedUpdate { reset,      │
+│             │   + notify         │   scroll_left,           │
+└─────────────┘                    │   scroll_right }         │
+      ↑                            └──────────────────────────┘
+      │                                       │
+      │ set Presented                         │ renderer wakes
+      │ + notify                              ↓
+┌─────────────┐                    ┌──────────────────────────┐
+│ Presenting  │                    │ [Renderer computes,      │
+│             │                    │  renders to texture]     │
+└─────────────┘                    └──────────────────────────┘
+      ↑                                       │
+      │ take texture                          │ 
+      │ set Presenting                        ↓
+┌─────────────┐  RenderComplete    ┌──────────────────────────┐
+│   Updated   │←──────────────────│ Updated(Arc<Texture>)    │
+│  (texture)  │                    └──────────────────────────┘
+└─────────────┘
+
+Exit: Terminal state for clean shutdown
+```
+
+**GifEncodeState (Renderer ↔ Encoder coordination):**
+
+```
+┌─────────┐  HasBuffer(Arc<Buffer>)  ┌─────────────┐
+│  Idle   │────────────────────────→ │  HasBuffer  │
+└─────────┘  (renderer sends frame)  └─────────────┘
+     ↑                                       │
+     │                                       │ encoder wakes
+     │                                       ↓
+     │ back to Idle            ┌─────────────────────────┐
+     │ after encoding          │  Encoding               │
+     └─────────────────────────│  (map buffer, convert,  │
+                               │   write GIF frame)      │
+                               └─────────────────────────┘
+
+Exit: Terminal state
+Encoding at wait loop top: unreachable!() - invariant
+```
+
+### Data Structures
+
+**Board Layout:**
+- Total size: 4000 cells wide × 300 cells tall
+- Viewport: 400 cells wide × 300 cells tall (visible area)
+- Cell size: 4×4 pixels
+- Window: 1600×1200 pixels
+
+**Viewport Positioning:**
+- `viewport_offset` tracks horizontal scroll position (0 to 3600)
+- Initially positioned at rightmost: `viewport_offset = 3600`
+- Arrow keys scroll left/right by configurable step (default 10 pixels)
+- Bounds checking prevents out-of-range scrolling
+
+**Circular Buffer:**
+- Vertical scrolling via `row_offset` for O(1) performance
+- When board fills, shifts by `STEPS_PER_FRAME` (10 rows)
+- Infinite downward evolution without reallocation
+
+**Cell States:**
+- `CellState::Zero` (white) and `CellState::One` (black)
+- Cyclic boundaries (edges wrap around per TLA+ spec)
+
+**Texture Pooling:**
+- Renderer owns two `Option<Arc<wgpu::Texture>>`
+- `presenting`: Currently shown to user (via main thread)
+- `rendering`: Next frame being prepared
+- Swap with `std::mem::swap()` after rendering
+- Only two textures created total (not per-frame)
+- `SceneState::Updated` clones Arc pointer, not texture data
+
+### Parallelism Strategy
+
+**Compute-Render-Present Pipeline:**
+```
+Frame N:   [Main: Present N-1] || [Renderer: Compute N]
+           [Main: Present N-1] || [Renderer: Render N]
+           [Main: Blit & Present N] || [Renderer: Wait]
+           
+Frame N+1: [Main: Present N] || [Renderer: Compute N+1]
+           ...
+```
+
+Renderer computes next frame while main thread presents current frame, maximizing parallelism.
+
+**GIF Capture Flow:**
+1. Renderer increments `frame_counter` each frame
+2. If `frame_counter % gif_frame_skip == 0` AND encoder is `Idle`:
+   - Create staging buffer, submit GPU copy (non-blocking)
+   - Send `Arc<Buffer>` to encoder
+   - Continue to next frame computation (parallel)
+3. Encoder thread maps buffer (blocking, isolated), converts, writes GIF frame
+4. Encoder returns to `Idle`, ready for next frame
+
+**Key Design Decisions:**
+- GIF capture is deterministic: every Nth frame (configurable)
+- Frame skipping when encoder busy (graceful degradation)
+- Blocking GPU operations isolated to encoder thread
+- Renderer never blocks on GPU or encoder
+
+### Input Handling
+
+**Keyboard Controls:**
+- **SPACE**: Hold to pause, release to resume (starts running)
+- **ESCAPE**: Reset to initial state (single cell at rightmost position)
+- **LEFT/RIGHT ARROWS**: Scroll viewport horizontally by configurable step
+
+**Flag Propagation Pattern:**
+1. Key event sets local flag on main thread (`need_reset`, `need_scroll_left`, `need_scroll_right`)
+2. No immediate redraw request
+3. On next `RedrawRequested` (from ongoing loop):
+   - Pass flags to `NeedUpdate { reset, scroll_left, scroll_right }`
+   - Clear flags immediately
+   - Notify renderer
+4. Renderer applies actions at beginning of next iteration
+
+**Benefits:**
+- Race-free: flags live on main thread
+- Simple: communicated once per frame
+- Clean: reuses existing state machine
+- Reliable: actions applied at safe points
+
+### Dependencies
+
+```toml
+winit = "0.30"          # Window management
+vello = "0.6.0"         # 2D GPU rendering
+wgpu = "26.0.1"         # GPU API
+pollster = "0.3"        # Block on async
+clap = { version = "4.5", features = ["derive"] }  # CLI
+gif = "0.13"            # GIF encoding (vendored, audited)
+```
+
+## Event Flow
+
+**Normal Operation:**
+```
+1. RedrawRequested (state: Presented)
+   └→ Main: Set NeedUpdate { reset: false, scroll_left: false, scroll_right: false }
+   └→ Main: Clear local flags
+   └→ Main: Notify renderer condvar
+
+2. Renderer wakes from condvar
+   └→ Check flags (all false, skip reset/scroll)
+   └→ Compute next 10 steps of Rule 110
+   └→ Build Vello scene with visible cells
+   └→ Render scene to texture (swap presenting ↔ rendering)
+   └→ Set Updated(Arc::clone(presenting))
+   └→ Notify main
+
+3. RenderComplete (state: Updated)
+   └→ Main: Take texture from Updated
+   └→ Main: Set Presenting
+   └→ Main: Blit texture to surface
+   └→ Main: Present surface
+   └→ Main: Set Presented
+   └→ Main: Notify renderer
+   └→ Main: request_redraw() for next frame
+
+4. [Optional] GIF Capture (parallel with next compute)
+   └→ Renderer: Increment frame_counter
+   └→ If frame_counter % gif_frame_skip == 0 and encoder Idle:
+      └→ Create staging buffer, copy texture (non-blocking submit)
+      └→ Send buffer to encoder as HasBuffer
+      └→ Continue to next frame
+   └→ Encoder: Map buffer, convert RGBA→grayscale, write GIF frame
+   └→ Encoder: Set Idle
+
+Loop continues...
+```
+
+**Reset Flow (ESCAPE pressed):**
+```
+1. ESCAPE key event
+   └→ Main: Set need_reset = true
+   
+2. Next RedrawRequested
+   └→ Main: Set NeedUpdate { reset: true, ... }
+   └→ Main: Clear need_reset = false
+   └→ Main: Notify renderer
+
+3. Renderer wakes
+   └→ Check reset flag (true)
+   └→ Recreate board with single cell at rightmost position
+   └→ Reset current_step = 0, frame_counter = 0
+   └→ Reset viewport_offset to rightmost position
+   └→ Continue with normal computation/rendering
+```
+
+**Scroll Flow (Arrow key pressed):**
+```
+1. LEFT/RIGHT arrow key event
+   └→ Main: Set need_scroll_left or need_scroll_right = true
+   
+2. Next RedrawRequested
+   └→ Main: Set NeedUpdate { scroll_left: true, ... } or { scroll_right: true, ... }
+   └→ Main: Clear scroll flags
+   └→ Main: Notify renderer
+
+3. Renderer wakes
+   └→ Check scroll flags
+   └→ If scroll_left: viewport_offset = viewport_offset.saturating_sub(scroll_step)
+   └→ If scroll_right: viewport_offset = min(viewport_offset + scroll_step, max_offset)
+   └→ Continue with normal computation/rendering (viewport affects scene building)
+```
+
+**Pause Flow (SPACE held):**
+```
+1. SPACE press → should_pause = true
+   └→ If was_paused = false: do nothing
+   
+2. While held → RedrawRequested skipped (not requested while paused)
+
+3. SPACE release → should_pause = false
+   └→ If was_paused = true: request_redraw() to resume
+```
+
+**Shutdown Flow:**
+```
+1. WindowEvent::CloseRequested
+   └→ Main: Set SceneState::Exit
+   └→ Main: Notify renderer
+
+2. Renderer receives Exit
+   └→ Break from main loop
+   └→ Set GifEncodeState::Exit (if recording)
+   └→ Notify encoder
+   └→ Join encoder thread handle
+   └→ Renderer thread exits
+
+3. ApplicationHandler::exiting
+   └→ Main: Join renderer thread handle
+   └→ Clean termination
+```
+
+## Usage
+
+**Basic Visualization:**
+```bash
+cargo run --release
+```
+
+**GIF Recording:**
+```bash
+# Every 10th frame (default)
+cargo run --release -- --record-gif output.gif
+
+# Every frame (smooth but large)
+cargo run --release -- --record-gif output.gif --gif-frame-skip 1
+
+# Every 30th frame (smaller, faster)
+cargo run --release -- --record-gif output.gif --gif-frame-skip 30
+```
+
+**Custom Scroll Speed:**
+```bash
+# Faster scrolling (20 pixels per keypress)
+cargo run --release -- --scroll-step 20
+
+# Slower scrolling (5 pixels per keypress)
+cargo run --release -- --scroll-step 5
+
+# Combined with GIF recording
+cargo run --release -- --record-gif out.gif --gif-frame-skip 15 --scroll-step 20
+```
+
+**Interactive Controls:**
+- **SPACE**: Hold to pause, release to resume
+- **ESCAPE**: Reset to initial state
+- **LEFT/RIGHT**: Scroll viewport horizontally
+
+---
+
+# Part II: Development History
 
 ## Project Goals
 
@@ -552,92 +921,43 @@ Refactored to pass `scroll_step` directly to the renderer function rather than s
 - Changed scrolling from `saturating_sub(10)` / `+ 10` to use `scroll_step` parameter
 - Updated README with usage example and parameter documentation
 
-## Code Quality
+### Episode 13: Code Quality and Invariants
 
 **User**: "remove prints(except the two re missed frame). `GifEncodeState::Encoding` at the top of the encoder is unreachable(or should be)."
 
-Removed unnecessary prints (kept diagnostic warnings). Made state machine invariant explicit: `Encoding` is `unreachable!()` in encoder's wait loop.
+Removed unnecessary debug prints (kept diagnostic warnings for missed frames). Made state machine invariant explicit: encountering `Encoding` state at top of encoder's wait loop is `unreachable!()` by design—encoder only transitions to `Encoding` after receiving `HasBuffer`, never wakes to find it already in that state.
 
-## Current Architecture
+---
 
-**Three threads**:
-- **Main**: Event loop, texture blitting, presentation
-- **Renderer**: Computation (parallel with presentation), scene building, rendering, GIF capture coordination
-- **Encoder**: Buffer mapping (blocking), RGBA→grayscale, GIF encoding
+## Key Learnings
 
-**Render-to-texture**: Renderer renders to wgpu texture, main blits to surface with `TextureBlitter`.
+### State Machine Design
+1. **Make invalid states unrepresentable**: Use enum variants to encode valid states, not booleans
+2. **Order variants by lifecycle**: Define enum variants in the order they occur in practice
+3. **Document invariants explicitly**: Use `unreachable!()` with comments to encode assumptions
+4. **Minimize state transitions**: Fewer states = easier to reason about, fewer bugs
 
-**Shared resources**: Single device/queue Arc-shared between threads.
+### Concurrent Architecture
+1. **Single ownership simplifies**: One thread owns mutable state exclusively (renderer owns board)
+2. **Local flags prevent races**: Keep user input state on main thread, communicate once per frame
+3. **Separate concerns by thread**: Blocking operations isolated (encoder thread for GPU mapping)
+4. **Design for graceful degradation**: Frame skipping when systems can't keep up
+5. **Overlap independent work**: Compute next frame while presenting current frame
 
-**Data structures**:
-- Circular buffer with `row_offset` for O(1) vertical scrolling
-- Board: 4000×300 cells (10x wider than viewport)
-- Viewport: 400×300 cells, horizontal position controlled by `viewport_offset`
-- Viewport starts at rightmost position (shows seed cell)
-- Cyclic boundaries (wraps at edges per TLA+ spec)
+### API Migration Lessons
+1. **Reference existing code**: User provided Servo's vello_backend.rs for wgpu 26 API examples
+2. **Read documentation carefully**: Don't assume stability between major versions
+3. **Understand ownership changes**: `TextureView` vs `Texture` has implications
 
-**State machines**:
-- `SceneState` (5 states): Presented, NeedUpdate { reset, scroll_left, scroll_right }, Updated, Presenting, Exit
-  - `NeedUpdate { reset: bool, scroll_left: bool, scroll_right: bool }`: named fields for reset and scrolling
-- `GifEncodeState` (4 states): Idle, HasBuffer, Encoding, Exit
+### User Guidance Patterns
+1. **Trust the spec**: TLA+ specification was correct, not "incomplete"
+2. **Simplify when possible**: User removed parallelism complexity when not needed
+3. **Determinism over cleverness**: Frame-counting GIF capture simpler than scheduling-based
+4. **Iterative refinement works**: Complex features (GIF, reset) evolved through multiple attempts
+5. **Make the right thing easy**: Good patterns (local flags) reused consistently
 
-**Reset mechanism**:
-- Main thread maintains local `need_reset` flag
-- ESCAPE key sets `need_reset = true` (no immediate redraw request)
-- On next `RedrawRequested`, passes flag to `NeedUpdate` and clears it
-- Renderer checks flag; if true, recreates board, resets counters, resets viewport to rightmost
-- Simple and race-free: reset state lives on main thread, communicated once per frame
-
-**Viewport scrolling**:
-- Main thread maintains local `need_scroll_left` and `need_scroll_right` flags
-- Arrow keys set respective flags (no immediate redraw request)
-- On next `RedrawRequested`, passes flags to `NeedUpdate` and clears them
-- Renderer adjusts `viewport_offset` by configurable `scroll_step` pixels (default 10) with bounds checking
-- Scroll step configurable via `--scroll-step` command-line argument
-- Allows exploration of full 4000-pixel-wide board
-- Same clean pattern as reset: local flags → state machine → renderer action
-
-**Parallelism**: Renderer computes frame N+1 while main presents frame N.
-
-**GIF capture**: Deterministic frame-counting approach - captures every Nth frame (configurable via `--gif-frame-skip`, default 10). Still checks encoder idle state to avoid overwhelming it. Simpler and more predictable than previous thread-scheduling-based approach.
-
-**Initial condition**: Single black cell at absolute rightmost position (`width - 1`), rest of first row initialized to `Zero`. Viewport starts at rightmost area showing the seed cell. Demonstrates complexity emerging from minimal starting state.
-
-**Non-blocking**: Renderer never blocks on GPU operations.
-
-**Frame skipping**: Graceful handling when encoder busy.
-
-**Infinite scrolling**: Shifts by 10 rows when board fills vertically.
-
-**Viewport scrolling**: Arrow keys scroll horizontally by configurable step size (default 10 pixels) per keypress to explore the wide board. Step size adjustable via `--scroll-step` argument.
-
-**Clean shutdown**: Exit states propagate, threads join properly.
-
-**Texture pooling**: Two `Option<Arc<wgpu::Texture>>` owned by renderer, swapped with `std::mem::swap()` after rendering. Only two textures created total, avoiding per-frame allocation overhead.
-
-**Dependencies**:
-- winit 0.30 - Window management
-- vello 0.6.0 - 2D rendering
-- wgpu 26.0.1 - GPU API
-- pollster 0.3 - Block on async operations
-- clap 4.5 - CLI parsing (with derive feature)
-- gif 0.13 - GIF encoding
-
-## Event Flow
-
-```
-SPACE released → request redraw (if was paused)
-ESCAPE pressed → set need_reset flag
-Arrow keys pressed → set need_scroll_left or need_scroll_right flag
-RedrawRequested (state: Presented) → set NeedUpdate { reset, scroll_left, scroll_right } + clear flags + notify renderer
-Renderer (computed and waiting) receives NeedUpdate → [if reset] recreate board & reset counters & reset viewport → [if scroll] adjust viewport_offset by ±scroll_step pixels → renders to texture → Updated(texture) + RenderComplete
-RenderComplete → take texture + set Presenting + blit to surface + present → set Presented + notify
-[If GIF enabled] Increment frame_counter; if frame_counter % gif_frame_skip == 0 and encoder idle → capture GIF
-Loop continues via next RedrawRequested
-
-Parallelism: Renderer computes frame N+1 while main thread presents frame N
-GIF capture: Deterministic - every Nth frame where N is configurable (default 10)
-GPU coordination: GIF capture happens after rendering, runs in parallel with next frame's computation
-Reset: Local flag on main thread, passed once per frame, applied in renderer before computation
-Viewport scrolling: Local flags on main thread, passed once per frame, applied in renderer after reset check; scroll distance configurable (default 10 pixels)
-```
+### Performance Insights
+1. **GPU contention is real**: Two threads submitting GPU work simultaneously caused blocking
+2. **Texture pooling matters**: Creating textures per-frame is wasteful
+3. **Non-blocking is critical**: Isolate blocking operations to dedicated threads
+4. **Measure, don't assume**: User's profiling data corrected my VSync assumption
