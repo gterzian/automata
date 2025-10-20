@@ -11,7 +11,7 @@ Supporting blog post: [TLA+ in support of AI code generation](https://medium.com
 - Interactive visualization with pause/unpause, reset, and viewport scrolling controls
 - System runs automatically and pauses while SPACE is held down
 - Release SPACE to resume computation and rendering (10 rows per frame)
-- Press ESCAPE to reset the automaton to its initial state
+- Press ESCAPE to reset the automaton; reuses the board with a random first row.
 - Use LEFT/RIGHT arrow keys to scroll the viewport horizontally across the board
 - Board is 10x wider than the visible window, providing space for pattern evolution
 - Starts with a single black cell at the rightmost position, viewport shows rightmost area

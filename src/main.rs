@@ -8,6 +8,7 @@
 
 use clap::Parser;
 use gif::{Encoder as GifEncoder, Frame, Repeat};
+use rand::Rng;
 use std::fs::File;
 use std::io::BufWriter;
 use std::sync::{Arc, Condvar, Mutex};
@@ -91,6 +92,27 @@ impl Board {
             width,
             height,
             row_offset: 0,
+        }
+    }
+
+    // Reset the board in-place. Clears all rows to None, then initializes
+    // the first row with random Zero/One values (uniform).
+    fn reset(&mut self) {
+        // Reset row_offset first so logical row 0 maps to physical row 0
+        self.row_offset = 0;
+
+        // Clear all cells to None
+        for r in 0..self.height {
+            for c in 0..self.width {
+                self.cells[r][c] = CellState::None;
+            }
+        }
+
+        // Initialize first logical row (physical row 0) to random bits
+        let mut rng = rand::thread_rng();
+        for col in 0..self.width {
+            let bit = rng.gen_bool(0.5);
+            self.cells[0][col] = if bit { CellState::One } else { CellState::Zero };
         }
     }
 
@@ -476,7 +498,7 @@ fn renderer(
                     } => {
                         // If reset flag is true, reset the board and counters
                         if reset {
-                            board = Board::new(BOARD_WIDTH, BOARD_HEIGHT);
+                            board.reset();
                             current_step = 1;
                             frame_counter = 0;
                             viewport_offset = BOARD_WIDTH - VISIBLE_BOARD_WIDTH;
